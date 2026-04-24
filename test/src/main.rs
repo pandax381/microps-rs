@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use microps::device::Device;
 use microps::driver::loopback;
+use microps::net::PROTOCOL_TYPE_IP;
 use microps::{errorf, infof, net};
 
 mod defs;
@@ -42,7 +43,7 @@ fn app_main() -> Result<(), ()> {
     infof!("press Ctrl+C to terminate");
     let dev = DEV.get().unwrap();
     while !TERMINATE.load(Ordering::Relaxed) {
-        if dev.output(0x0800, TEST_DATA, &[]).is_err() {
+        if dev.output(PROTOCOL_TYPE_IP, TEST_DATA, &[]).is_err() {
             errorf!("dev.output() failure");
             break;
         }
