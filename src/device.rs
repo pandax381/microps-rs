@@ -5,6 +5,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use spin::Mutex;
@@ -33,6 +34,14 @@ pub trait Ops: Send + Sync {
     fn transmit(&self, dev: &Device, ty: u16, data: &[u8], dst: &[u8]) -> Result<(), ()>;
 }
 
+pub const FAMILY_IP: u16 = 1;
+pub const FAMILY_IPV6: u16 = 2;
+
+pub trait NetIface: Send + Sync + 'static {
+    fn family(&self) -> u16;
+    fn as_any(&self) -> &dyn Any;
+}
+
 pub struct Device {
     pub index: usize,
     pub name: String,
@@ -44,6 +53,7 @@ pub struct Device {
     pub peer: [u8; ADDR_LEN],
     pub broadcast: [u8; ADDR_LEN],
     flags: AtomicU16,
+    ifaces: Mutex<Vec<Arc<dyn NetIface>>>,
     ops: Box<dyn Ops>,
 }
 
@@ -60,8 +70,28 @@ impl Device {
             peer: [0; ADDR_LEN],
             broadcast: [0; ADDR_LEN],
             flags: AtomicU16::new(flags),
+            ifaces: Mutex::new(Vec::new()),
             ops,
         }
+    }
+
+    pub fn add_iface(&self, iface: Arc<dyn NetIface>) -> Result<(), ()> {
+        let mut ifaces = self.ifaces.lock();
+        let family = iface.family();
+        if ifaces.iter().any(|existing| existing.family() == family) {
+            crate::errorf!("iface already exists, dev={}", self.name);
+            return Err(());
+        }
+        ifaces.push(iface);
+        Ok(())
+    }
+
+    pub fn get_iface(&self, family: u16) -> Option<Arc<dyn NetIface>> {
+        self.ifaces
+            .lock()
+            .iter()
+            .find(|iface| iface.family() == family)
+            .cloned()
     }
 
     pub fn flags(&self) -> u16 {

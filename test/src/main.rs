@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use microps::device::Device;
 use microps::driver::loopback;
+use microps::ip;
 use microps::net::PROTOCOL_TYPE_IP;
 use microps::{errorf, infof, net};
 
 mod defs;
 
-use defs::TEST_DATA;
+use defs::{LOOPBACK_IP_ADDR, LOOPBACK_NETMASK, TEST_DATA};
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 static DEV: OnceLock<Arc<Device>> = OnceLock::new();
@@ -29,6 +30,7 @@ fn setup() -> Result<(), ()> {
     }
     net::init()?;
     let dev = loopback::init();
+    ip::iface_register(&dev, LOOPBACK_IP_ADDR, LOOPBACK_NETMASK)?;
     DEV.set(dev).ok();
     net::run()?;
     Ok(())

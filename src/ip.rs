@@ -1,9 +1,14 @@
 //! IP protocol.
 
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::any::Any;
 use core::fmt;
 use core::str::FromStr;
 
-use crate::device::Device;
+use spin::Mutex;
+
+use crate::device::{Device, NetIface, FAMILY_IP};
 use crate::net;
 use crate::util;
 
@@ -111,6 +116,74 @@ impl<'a> IpHdr<'a> {
     }
 }
 
+pub struct IpIface {
+    dev: Arc<Device>,
+    unicast: IpAddr,
+    netmask: IpAddr,
+    broadcast: IpAddr,
+}
+
+impl IpIface {
+    pub fn dev(&self) -> &Arc<Device> {
+        &self.dev
+    }
+
+    pub fn unicast(&self) -> IpAddr {
+        self.unicast
+    }
+
+    pub fn netmask(&self) -> IpAddr {
+        self.netmask
+    }
+
+    pub fn broadcast(&self) -> IpAddr {
+        self.broadcast
+    }
+}
+
+impl NetIface for IpIface {
+    fn family(&self) -> u16 {
+        FAMILY_IP
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+static IFACES: Mutex<Vec<Arc<IpIface>>> = Mutex::new(Vec::new());
+
+pub fn iface_register(
+    dev: &Arc<Device>,
+    unicast: &str,
+    netmask: &str,
+) -> Result<Arc<IpIface>, ()> {
+    let unicast: IpAddr = unicast.parse()?;
+    let netmask: IpAddr = netmask.parse()?;
+    let broadcast = IpAddr([
+        unicast.0[0] | !netmask.0[0],
+        unicast.0[1] | !netmask.0[1],
+        unicast.0[2] | !netmask.0[2],
+        unicast.0[3] | !netmask.0[3],
+    ]);
+    let iface = Arc::new(IpIface {
+        dev: Arc::clone(dev),
+        unicast,
+        netmask,
+        broadcast,
+    });
+    dev.add_iface(iface.clone())?;
+    IFACES.lock().push(iface.clone());
+    crate::infof!(
+        "dev={}, unicast={}, netmask={}, broadcast={}",
+        dev.name,
+        unicast,
+        netmask,
+        broadcast
+    );
+    Ok(iface)
+}
+
 fn print(data: &[u8]) {
     if let Some(hdr) = IpHdr::new(data) {
         crate::printf!(
@@ -168,6 +241,20 @@ fn input(data: &[u8], dev: &Device) {
     let offset = hdr.offset();
     if offset & IP_HDR_FLAG_MF != 0 || offset & IP_HDR_OFFSET_MASK != 0 {
         crate::errorf!("fragments does not support");
+        return;
+    }
+    let net_iface = match dev.get_iface(FAMILY_IP) {
+        Some(i) => i,
+        None => return,
+    };
+    let iface = match net_iface.as_any().downcast_ref::<IpIface>() {
+        Some(i) => i,
+        None => return,
+    };
+    if hdr.dst() != iface.unicast
+        && hdr.dst() != iface.broadcast
+        && hdr.dst() != IpAddr::BROADCAST
+    {
         return;
     }
     print(data);
