@@ -5,10 +5,10 @@ use std::thread;
 use std::time::Duration;
 
 use microps::device::Device;
+use microps::driver::loopback;
 use microps::{errorf, infof, net};
 
 mod defs;
-mod dummy;
 
 use defs::TEST_DATA;
 
@@ -27,7 +27,7 @@ fn setup() -> Result<(), ()> {
         libc::sigaction(libc::SIGINT, &sa, core::ptr::null_mut());
     }
     net::init()?;
-    let dev = dummy::init();
+    let dev = loopback::init();
     DEV.set(dev).ok();
     net::run()?;
     Ok(())

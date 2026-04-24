@@ -1,5 +1,6 @@
 //! Network device abstraction.
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -20,6 +21,18 @@ pub const FLAG_BROADCAST: u16 = 0x0020;
 pub const FLAG_P2P: u16 = 0x0040;
 pub const FLAG_NEED_ARP: u16 = 0x0100;
 
+pub trait Ops: Send + Sync {
+    fn open(&self, _dev: &Device) -> Result<(), ()> {
+        Ok(())
+    }
+
+    fn close(&self, _dev: &Device) -> Result<(), ()> {
+        Ok(())
+    }
+
+    fn transmit(&self, dev: &Device, ty: u16, data: &[u8], dst: &[u8]) -> Result<(), ()>;
+}
+
 pub struct Device {
     pub index: usize,
     pub name: String,
@@ -31,10 +44,11 @@ pub struct Device {
     pub peer: [u8; ADDR_LEN],
     pub broadcast: [u8; ADDR_LEN],
     flags: AtomicU16,
+    ops: Box<dyn Ops>,
 }
 
 impl Device {
-    pub fn new(ty: u16, mtu: u16, flags: u16) -> Self {
+    pub fn new(ty: u16, mtu: u16, flags: u16, ops: Box<dyn Ops>) -> Self {
         Self {
             index: 0,
             name: String::new(),
@@ -46,6 +60,7 @@ impl Device {
             peer: [0; ADDR_LEN],
             broadcast: [0; ADDR_LEN],
             flags: AtomicU16::new(flags),
+            ops,
         }
     }
 
@@ -70,6 +85,9 @@ impl Device {
             crate::errorf!("already opened, dev={}", self.name);
             return Err(());
         }
+        self.ops.open(self).map_err(|_| {
+            crate::errorf!("open failure, dev={}", self.name);
+        })?;
         self.flags.fetch_or(FLAG_UP, Ordering::AcqRel);
         crate::infof!("dev={}, state={}", self.name, self.state());
         Ok(())
@@ -80,12 +98,15 @@ impl Device {
             crate::errorf!("not opened, dev={}", self.name);
             return Err(());
         }
+        self.ops.close(self).map_err(|_| {
+            crate::errorf!("close failure, dev={}", self.name);
+        })?;
         self.flags.fetch_and(!FLAG_UP, Ordering::AcqRel);
         crate::infof!("dev={}, state={}", self.name, self.state());
         Ok(())
     }
 
-    pub fn output(&self, ty: u16, data: &[u8], _dst: &[u8]) -> Result<(), ()> {
+    pub fn output(&self, ty: u16, data: &[u8], dst: &[u8]) -> Result<(), ()> {
         if !self.is_up() {
             crate::errorf!("not opened, dev={}", self.name);
             return Err(());
@@ -101,7 +122,9 @@ impl Device {
         }
         crate::debugf!("dev={}, type=0x{:04x}, len={}", self.name, ty, data.len());
         crate::printf!("{}", crate::util::HexDump(data));
-        Ok(())
+        self.ops.transmit(self, ty, data, dst).map_err(|_| {
+            crate::errorf!("transmit failure, dev={}", self.name);
+        })
     }
 }
 

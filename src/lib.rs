@@ -6,6 +6,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod device;
+pub mod driver;
 pub mod log;
 pub mod net;
 pub mod platform;
