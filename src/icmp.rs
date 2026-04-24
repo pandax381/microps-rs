@@ -1,6 +1,8 @@
 //! ICMP protocol.
 
-use crate::ip::{self, IpHdr, IpIface, IP_PROTOCOL_ICMP};
+use alloc::vec;
+
+use crate::ip::{self, IpAddr, IpHdr, IpIface, IP_PROTOCOL_ICMP};
 use crate::util;
 
 pub const ICMP_HDR_SIZE: usize = 8;
@@ -16,6 +18,13 @@ pub const ICMP_TYPE_TIMESTAMP: u8 = 13;
 pub const ICMP_TYPE_TIMESTAMP_REPLY: u8 = 14;
 pub const ICMP_TYPE_INFO_REQUEST: u8 = 15;
 pub const ICMP_TYPE_INFO_REPLY: u8 = 16;
+
+pub const ICMP_CODE_NET_UNREACH: u8 = 0;
+pub const ICMP_CODE_HOST_UNREACH: u8 = 1;
+pub const ICMP_CODE_PROTO_UNREACH: u8 = 2;
+pub const ICMP_CODE_PORT_UNREACH: u8 = 3;
+pub const ICMP_CODE_FRAGMENT_NEEDED: u8 = 4;
+pub const ICMP_CODE_SOURCE_ROUTE_FAILED: u8 = 5;
 
 pub struct IcmpCommon<'a> {
     data: &'a [u8],
@@ -123,6 +132,34 @@ fn print(data: &[u8]) {
     crate::printf!("{}", crate::util::HexDump(data));
 }
 
+pub fn output(
+    ty: u8,
+    code: u8,
+    values: u32,
+    data: &[u8],
+    src: IpAddr,
+    dst: IpAddr,
+) -> Result<(), ()> {
+    let total = ICMP_HDR_SIZE + data.len();
+    let mut buf = vec![0u8; total];
+    buf[0] = ty;
+    buf[1] = code;
+    buf[4..8].copy_from_slice(&values.to_be_bytes());
+    buf[ICMP_HDR_SIZE..].copy_from_slice(data);
+    let sum = util::cksum16(&buf, 0);
+    buf[2..4].copy_from_slice(&sum.to_ne_bytes());
+    crate::debugf!(
+        "{} => {}, type={} ({}), len={}",
+        src,
+        dst,
+        ty,
+        type_name(ty),
+        total
+    );
+    print(&buf);
+    ip::output(IP_PROTOCOL_ICMP, &buf, src, dst)
+}
+
 fn input(hdr: &IpHdr<'_>, data: &[u8], iface: &IpIface) {
     crate::debugf!(
         "{} => {}, dev={}, len={}",
@@ -141,6 +178,17 @@ fn input(hdr: &IpHdr<'_>, data: &[u8], iface: &IpIface) {
         return;
     }
     print(data);
+    let com = IcmpCommon::new(data).unwrap();
+    if com.ty() == ICMP_TYPE_ECHO {
+        let _ = output(
+            ICMP_TYPE_ECHO_REPLY,
+            0,
+            com.dep(),
+            &data[ICMP_HDR_SIZE..],
+            iface.unicast(),
+            hdr.src(),
+        );
+    }
 }
 
 pub fn init() -> Result<(), ()> {

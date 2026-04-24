@@ -384,6 +384,16 @@ fn input(data: &[u8], dev: &Device) {
     };
     if let Some(handler) = handler {
         handler(&hdr, &data[hlen..total], iface);
+    } else {
+        let icmp_data_len = hlen + core::cmp::min(8, total - hlen);
+        let _ = crate::icmp::output(
+            crate::icmp::ICMP_TYPE_DEST_UNREACH,
+            crate::icmp::ICMP_CODE_PROTO_UNREACH,
+            0,
+            &data[..icmp_data_len],
+            iface.unicast,
+            hdr.src(),
+        );
     }
 }
 

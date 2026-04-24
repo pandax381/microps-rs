@@ -4,7 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use microps::driver::loopback;
-use microps::ip::{self, IpAddr, IP_PROTOCOL_ICMP};
+use microps::icmp::{self, ICMP_TYPE_ECHO};
+use microps::ip::{self, IpAddr};
 use microps::{errorf, infof, net};
 
 mod defs;
@@ -40,11 +41,15 @@ fn app_main() -> Result<(), ()> {
     infof!("press Ctrl+C to terminate");
     let src: IpAddr = LOOPBACK_IP_ADDR.parse()?;
     let dst = src;
+    let id = unsafe { libc::getpid() } as u16;
+    let mut seq: u16 = 0;
     while !TERMINATE.load(Ordering::Relaxed) {
-        if ip::output(IP_PROTOCOL_ICMP, &TEST_DATA[20..], src, dst).is_err() {
-            errorf!("ip::output() failure");
+        let values = ((id as u32) << 16) | seq as u32;
+        if icmp::output(ICMP_TYPE_ECHO, 0, values, &TEST_DATA[28..], src, dst).is_err() {
+            errorf!("icmp::output() failure");
             break;
         }
+        seq = seq.wrapping_add(1);
         thread::sleep(Duration::from_secs(1));
     }
     infof!("terminate");
