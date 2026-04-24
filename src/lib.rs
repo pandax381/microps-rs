@@ -5,6 +5,7 @@ extern crate alloc;
 #[cfg(feature = "linux")]
 extern crate std;
 
+pub mod device;
 pub mod log;
 pub mod net;
 pub mod platform;

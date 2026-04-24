@@ -10,12 +10,16 @@ pub fn init() -> Result<(), ()> {
 pub fn run() -> Result<(), ()> {
     crate::infof!("startup...");
     crate::platform::run()?;
+    crate::device::try_foreach(|dev| dev.open())?;
     crate::infof!("success");
     Ok(())
 }
 
 pub fn shutdown() {
     crate::infof!("shutting down...");
+    crate::device::foreach(|dev| {
+        let _ = dev.close();
+    });
     crate::platform::shutdown();
     crate::infof!("success");
 }

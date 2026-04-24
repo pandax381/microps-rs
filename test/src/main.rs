@@ -1,11 +1,19 @@
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use microps::{infof, net};
+use microps::device::Device;
+use microps::{errorf, infof, net};
+
+mod defs;
+mod dummy;
+
+use defs::TEST_DATA;
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
+static DEV: OnceLock<Arc<Device>> = OnceLock::new();
 
 extern "C" fn on_signal(_signum: libc::c_int) {
     TERMINATE.store(true, Ordering::Relaxed);
@@ -19,6 +27,8 @@ fn setup() -> Result<(), ()> {
         libc::sigaction(libc::SIGINT, &sa, core::ptr::null_mut());
     }
     net::init()?;
+    let dev = dummy::init();
+    DEV.set(dev).ok();
     net::run()?;
     Ok(())
 }
@@ -30,7 +40,12 @@ fn cleanup() -> Result<(), ()> {
 
 fn app_main() -> Result<(), ()> {
     infof!("press Ctrl+C to terminate");
+    let dev = DEV.get().unwrap();
     while !TERMINATE.load(Ordering::Relaxed) {
+        if dev.output(0x0800, TEST_DATA, &[]).is_err() {
+            errorf!("dev.output() failure");
+            break;
+        }
         thread::sleep(Duration::from_secs(1));
     }
     infof!("terminate");
