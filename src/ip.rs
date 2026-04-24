@@ -22,6 +22,30 @@ pub const IP_HDR_FLAG_DF: u16 = 0x4000; // don't fragment flag
 pub const IP_HDR_FLAG_RF: u16 = 0x8000; // reserved
 pub const IP_HDR_OFFSET_MASK: u16 = 0x1fff;
 
+pub const IP_PROTOCOL_ICMP: u8 = 1;
+pub const IP_PROTOCOL_TCP: u8 = 6;
+pub const IP_PROTOCOL_UDP: u8 = 17;
+
+pub type ProtocolHandler = fn(hdr: &IpHdr<'_>, data: &[u8], iface: &IpIface);
+
+struct Protocol {
+    protocol: u8,
+    handler: ProtocolHandler,
+}
+
+static PROTOCOLS: Mutex<Vec<Protocol>> = Mutex::new(Vec::new());
+
+pub fn register_protocol(protocol: u8, handler: ProtocolHandler) -> Result<(), ()> {
+    let mut protocols = PROTOCOLS.lock();
+    if protocols.iter().any(|p| p.protocol == protocol) {
+        crate::errorf!("already registered, protocol={}", protocol);
+        return Err(());
+    }
+    protocols.push(Protocol { protocol, handler });
+    crate::infof!("registered, protocol={}", protocol);
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpAddr(pub [u8; IP_ADDR_LEN]);
 
@@ -351,6 +375,16 @@ fn input(data: &[u8], dev: &Device) {
         return;
     }
     print(data);
+    let handler = {
+        let protocols = PROTOCOLS.lock();
+        protocols
+            .iter()
+            .find(|p| p.protocol == hdr.protocol())
+            .map(|p| p.handler)
+    };
+    if let Some(handler) = handler {
+        handler(&hdr, &data[hlen..total], iface);
+    }
 }
 
 pub fn init() -> Result<(), ()> {

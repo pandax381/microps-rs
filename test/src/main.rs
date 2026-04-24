@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use microps::driver::loopback;
-use microps::ip::{self, IpAddr};
+use microps::ip::{self, IpAddr, IP_PROTOCOL_ICMP};
 use microps::{errorf, infof, net};
 
 mod defs;
@@ -41,7 +41,7 @@ fn app_main() -> Result<(), ()> {
     let src: IpAddr = LOOPBACK_IP_ADDR.parse()?;
     let dst = src;
     while !TERMINATE.load(Ordering::Relaxed) {
-        if ip::output(1, &TEST_DATA[20..], src, dst).is_err() {
+        if ip::output(IP_PROTOCOL_ICMP, &TEST_DATA[20..], src, dst).is_err() {
             errorf!("ip::output() failure");
             break;
         }

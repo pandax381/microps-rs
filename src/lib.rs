@@ -7,6 +7,7 @@ extern crate std;
 
 pub mod device;
 pub mod driver;
+pub mod icmp;
 pub mod ip;
 pub mod log;
 pub mod net;
