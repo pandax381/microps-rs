@@ -4,6 +4,9 @@ use std::eprintln;
 use std::time::SystemTime;
 
 pub fn init() -> Result<(), ()> {
+    let mut ts: libc::timespec = unsafe { core::mem::zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+    unsafe { libc::srand(ts.tv_nsec as libc::c_uint) };
     Ok(())
 }
 
@@ -17,6 +20,10 @@ pub fn now() -> core::time::Duration {
     let mut ts: libc::timespec = unsafe { core::mem::zeroed() };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     core::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
+pub fn random32() -> u32 {
+    unsafe { libc::rand() as u32 }
 }
 
 pub fn log_output(level: char, file: &str, line: u32, function: &str, args: core::fmt::Arguments) {

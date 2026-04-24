@@ -1,6 +1,7 @@
 //! IP protocol.
 
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt;
@@ -8,7 +9,7 @@ use core::str::FromStr;
 
 use spin::Mutex;
 
-use crate::device::{Device, NetIface, FAMILY_IP};
+use crate::device::{Device, NetIface, ADDR_LEN, FAMILY_IP, FLAG_NEED_ARP};
 use crate::net;
 use crate::util;
 
@@ -139,6 +140,15 @@ impl IpIface {
     pub fn broadcast(&self) -> IpAddr {
         self.broadcast
     }
+
+    pub fn contains(&self, addr: IpAddr) -> bool {
+        for i in 0..IP_ADDR_LEN {
+            if (addr.0[i] & self.netmask.0[i]) != (self.unicast.0[i] & self.netmask.0[i]) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl NetIface for IpIface {
@@ -152,6 +162,89 @@ impl NetIface for IpIface {
 }
 
 static IFACES: Mutex<Vec<Arc<IpIface>>> = Mutex::new(Vec::new());
+
+pub fn iface_select(addr: IpAddr) -> Option<Arc<IpIface>> {
+    IFACES
+        .lock()
+        .iter()
+        .find(|iface| iface.unicast == addr)
+        .cloned()
+}
+
+fn build_packet(
+    protocol: u8,
+    data: &[u8],
+    src: IpAddr,
+    dst: IpAddr,
+    id: u16,
+) -> Result<Vec<u8>, ()> {
+    let total = IP_HDR_SIZE_MIN + data.len();
+    if total > u16::MAX as usize {
+        crate::errorf!("too long, total={}", total);
+        return Err(());
+    }
+    let mut buf = vec![0u8; total];
+    buf[0] = (IP_VERSION_IPV4 << 4) | ((IP_HDR_SIZE_MIN / 4) as u8);
+    buf[1] = 0;
+    buf[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    buf[4..6].copy_from_slice(&id.to_be_bytes());
+    buf[6..8].copy_from_slice(&0u16.to_be_bytes());
+    buf[8] = 255;
+    buf[9] = protocol;
+    buf[12..16].copy_from_slice(&src.0);
+    buf[16..20].copy_from_slice(&dst.0);
+    let checksum = util::cksum16(&buf[..IP_HDR_SIZE_MIN], 0);
+    buf[10..12].copy_from_slice(&checksum.to_ne_bytes());
+    buf[IP_HDR_SIZE_MIN..].copy_from_slice(data);
+    Ok(buf)
+}
+
+fn output_device(iface: &IpIface, buf: &[u8], target: IpAddr) -> Result<(), ()> {
+    crate::debugf!("dev={}, len={}, target={}", iface.dev.name, buf.len(), target);
+    let mut hwaddr = [0u8; ADDR_LEN];
+    if iface.dev.flags() & FLAG_NEED_ARP != 0 {
+        if target == iface.broadcast || target == IpAddr::BROADCAST {
+            let alen = iface.dev.alen as usize;
+            hwaddr[..alen].copy_from_slice(&iface.dev.broadcast[..alen]);
+        } else {
+            crate::errorf!("ARP does not implement");
+            return Err(());
+        }
+    }
+    iface.dev.output(net::PROTOCOL_TYPE_IP, buf, &hwaddr)
+}
+
+pub fn output(protocol: u8, data: &[u8], src: IpAddr, dst: IpAddr) -> Result<(), ()> {
+    crate::debugf!("{} => {}, protocol={}, len={}", src, dst, protocol, data.len());
+    if src == IpAddr::ANY {
+        crate::errorf!("ip routing does not implement");
+        return Err(());
+    }
+    let iface = match iface_select(src) {
+        Some(i) => i,
+        None => {
+            crate::errorf!("iface not found, src={}", src);
+            return Err(());
+        }
+    };
+    if !iface.contains(dst) && dst != IpAddr::BROADCAST {
+        crate::errorf!("not reached, dst={}", dst);
+        return Err(());
+    }
+    if (iface.dev.mtu as usize) < IP_HDR_SIZE_MIN + data.len() {
+        crate::errorf!(
+            "too long, dev={}, mtu={} < {}",
+            iface.dev.name,
+            iface.dev.mtu,
+            IP_HDR_SIZE_MIN + data.len()
+        );
+        return Err(());
+    }
+    let id = crate::platform::random32() as u16;
+    let buf = build_packet(protocol, data, iface.unicast, dst, id)?;
+    print(&buf);
+    output_device(&iface, &buf, dst)
+}
 
 pub fn iface_register(
     dev: &Arc<Device>,

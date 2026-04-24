@@ -1,13 +1,10 @@
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use microps::device::Device;
 use microps::driver::loopback;
-use microps::ip;
-use microps::net::PROTOCOL_TYPE_IP;
+use microps::ip::{self, IpAddr};
 use microps::{errorf, infof, net};
 
 mod defs;
@@ -15,7 +12,6 @@ mod defs;
 use defs::{LOOPBACK_IP_ADDR, LOOPBACK_NETMASK, TEST_DATA};
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
-static DEV: OnceLock<Arc<Device>> = OnceLock::new();
 
 extern "C" fn on_signal(_signum: libc::c_int) {
     TERMINATE.store(true, Ordering::Relaxed);
@@ -31,7 +27,6 @@ fn setup() -> Result<(), ()> {
     net::init()?;
     let dev = loopback::init();
     ip::iface_register(&dev, LOOPBACK_IP_ADDR, LOOPBACK_NETMASK)?;
-    DEV.set(dev).ok();
     net::run()?;
     Ok(())
 }
@@ -43,10 +38,11 @@ fn cleanup() -> Result<(), ()> {
 
 fn app_main() -> Result<(), ()> {
     infof!("press Ctrl+C to terminate");
-    let dev = DEV.get().unwrap();
+    let src: IpAddr = LOOPBACK_IP_ADDR.parse()?;
+    let dst = src;
     while !TERMINATE.load(Ordering::Relaxed) {
-        if dev.output(PROTOCOL_TYPE_IP, TEST_DATA, &[]).is_err() {
-            errorf!("dev.output() failure");
+        if ip::output(1, &TEST_DATA[20..], src, dst).is_err() {
+            errorf!("ip::output() failure");
             break;
         }
         thread::sleep(Duration::from_secs(1));
