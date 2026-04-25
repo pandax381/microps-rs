@@ -5,6 +5,7 @@ use std::time::SystemTime;
 
 pub mod driver;
 pub mod intr;
+pub mod softirq;
 pub mod timer;
 
 pub fn init() -> Result<(), ()> {
@@ -12,18 +13,21 @@ pub fn init() -> Result<(), ()> {
     unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
     unsafe { libc::srand(ts.tv_nsec as libc::c_uint) };
     intr::init()?;
+    softirq::init()?;
     timer::init()?;
     Ok(())
 }
 
 pub fn run() -> Result<(), ()> {
     intr::run()?;
+    softirq::run()?;
     timer::run()?;
     Ok(())
 }
 
 pub fn shutdown() {
     timer::shutdown();
+    softirq::shutdown();
     intr::shutdown();
 }
 

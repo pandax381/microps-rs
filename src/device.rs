@@ -170,6 +170,10 @@ pub fn register(mut dev: Device) -> Arc<Device> {
     arc
 }
 
+pub fn by_index(index: usize) -> Option<Arc<Device>> {
+    DEVICES.lock().get(index).cloned()
+}
+
 pub fn foreach<F>(mut f: F)
 where
     F: FnMut(&Device),

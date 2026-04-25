@@ -1,5 +1,7 @@
 //! Network stack lifecycle and protocol dispatch.
 
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use spin::Mutex;
@@ -17,7 +19,14 @@ struct Protocol {
     handler: ProtocolHandler,
 }
 
+struct InputEntry {
+    ty: u16,
+    data: Vec<u8>,
+    dev: Arc<Device>,
+}
+
 static PROTOCOLS: Mutex<Vec<Protocol>> = Mutex::new(Vec::new());
+static INPUT_QUEUE: Mutex<VecDeque<InputEntry>> = Mutex::new(VecDeque::new());
 
 pub fn register_protocol(ty: u16, handler: ProtocolHandler) -> Result<(), ()> {
     let mut protocols = PROTOCOLS.lock();
@@ -60,12 +69,40 @@ pub fn shutdown() {
 pub fn input_handler(ty: u16, data: &[u8], dev: &Device) -> Result<(), ()> {
     crate::debugf!("dev={}, type=0x{:04x}, len={}", dev.name, ty, data.len());
     crate::printf!("{}", crate::util::HexDump(data));
-    let handler = {
-        let protocols = PROTOCOLS.lock();
-        protocols.iter().find(|p| p.ty == ty).map(|p| p.handler)
-    };
-    if let Some(handler) = handler {
-        handler(data, dev);
+    if !PROTOCOLS.lock().iter().any(|p| p.ty == ty) {
+        return Ok(());
     }
+    let arc = match crate::device::by_index(dev.index) {
+        Some(a) => a,
+        None => {
+            crate::errorf!("device not registered, index={}", dev.index);
+            return Err(());
+        }
+    };
+    INPUT_QUEUE.lock().push_back(InputEntry {
+        ty,
+        data: data.to_vec(),
+        dev: arc,
+    });
+    crate::platform::softirq::raise();
     Ok(())
+}
+
+pub fn softirq_handler() {
+    loop {
+        let entry = match INPUT_QUEUE.lock().pop_front() {
+            Some(e) => e,
+            None => break,
+        };
+        let handler = {
+            let protocols = PROTOCOLS.lock();
+            protocols
+                .iter()
+                .find(|p| p.ty == entry.ty)
+                .map(|p| p.handler)
+        };
+        if let Some(handler) = handler {
+            handler(&entry.data, entry.dev.as_ref());
+        }
+    }
 }

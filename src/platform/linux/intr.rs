@@ -133,6 +133,16 @@ pub fn shutdown() {
     }
 }
 
+/// Raise an IRQ by sending its signal to the current process.
+///
+/// Async-signal-safe (libc::kill is on the POSIX list); usable from
+/// signal handlers.
+pub fn raise(irq: IrqNumber) {
+    unsafe {
+        libc::kill(libc::getpid(), irq as libc::c_int);
+    }
+}
+
 fn intr_main(barrier: Arc<Barrier>, sigmask: SigSet) {
     let block_all = SigSet::full();
     unsafe {
