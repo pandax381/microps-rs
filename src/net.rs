@@ -33,6 +33,7 @@ pub fn register_protocol(ty: u16, handler: ProtocolHandler) -> Result<(), ()> {
 pub fn init() -> Result<(), ()> {
     crate::infof!("initialize...");
     crate::platform::init()?;
+    crate::arp::init()?;
     crate::ip::init()?;
     crate::icmp::init()?;
     crate::infof!("success");
