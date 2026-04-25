@@ -3,18 +3,25 @@
 use std::eprintln;
 use std::time::SystemTime;
 
+pub mod driver;
+pub mod intr;
+
 pub fn init() -> Result<(), ()> {
     let mut ts: libc::timespec = unsafe { core::mem::zeroed() };
     unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
     unsafe { libc::srand(ts.tv_nsec as libc::c_uint) };
+    intr::init()?;
     Ok(())
 }
 
 pub fn run() -> Result<(), ()> {
+    intr::run()?;
     Ok(())
 }
 
-pub fn shutdown() {}
+pub fn shutdown() {
+    intr::shutdown();
+}
 
 pub fn now() -> core::time::Duration {
     let mut ts: libc::timespec = unsafe { core::mem::zeroed() };

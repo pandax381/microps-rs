@@ -4,13 +4,17 @@ use std::thread;
 use std::time::Duration;
 
 use microps::driver::loopback;
-use microps::icmp::{self, ICMP_TYPE_ECHO};
-use microps::ip::{self, IpAddr};
-use microps::{errorf, infof, net};
+use microps::ether::EtherAddr;
+use microps::ip;
+use microps::platform::driver::ether_tap;
+use microps::{infof, net};
 
 mod defs;
 
-use defs::{LOOPBACK_IP_ADDR, LOOPBACK_NETMASK, TEST_DATA};
+use defs::{
+    ETHER_TAP_HW_ADDR, ETHER_TAP_IP_ADDR, ETHER_TAP_NAME, ETHER_TAP_NETMASK, LOOPBACK_IP_ADDR,
+    LOOPBACK_NETMASK,
+};
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 
@@ -26,8 +30,14 @@ fn setup() -> Result<(), ()> {
         libc::sigaction(libc::SIGINT, &sa, core::ptr::null_mut());
     }
     net::init()?;
-    let dev = loopback::init();
-    ip::iface_register(&dev, LOOPBACK_IP_ADDR, LOOPBACK_NETMASK)?;
+
+    let lo = loopback::init();
+    ip::iface_register(&lo, LOOPBACK_IP_ADDR, LOOPBACK_NETMASK)?;
+
+    let mac: EtherAddr = ETHER_TAP_HW_ADDR.parse()?;
+    let en = ether_tap::init(ETHER_TAP_NAME, Some(mac))?;
+    ip::iface_register(&en, ETHER_TAP_IP_ADDR, ETHER_TAP_NETMASK)?;
+
     net::run()?;
     Ok(())
 }
@@ -39,17 +49,7 @@ fn cleanup() -> Result<(), ()> {
 
 fn app_main() -> Result<(), ()> {
     infof!("press Ctrl+C to terminate");
-    let src: IpAddr = LOOPBACK_IP_ADDR.parse()?;
-    let dst = src;
-    let id = unsafe { libc::getpid() } as u16;
-    let mut seq: u16 = 0;
     while !TERMINATE.load(Ordering::Relaxed) {
-        let values = ((id as u32) << 16) | seq as u32;
-        if icmp::output(ICMP_TYPE_ECHO, 0, values, &TEST_DATA[28..], src, dst).is_err() {
-            errorf!("icmp::output() failure");
-            break;
-        }
-        seq = seq.wrapping_add(1);
         thread::sleep(Duration::from_secs(1));
     }
     infof!("terminate");
