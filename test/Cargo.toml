@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 microps = { path = ".." }
 libc = "0.2"
+
+[[bin]]
+name = "tap_test"
+path = "src/tap_test.rs"

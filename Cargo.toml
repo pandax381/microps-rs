@@ -1,6 +1,11 @@
 [workspace]
 members = [
     "test",
+    "xtask",
+]
+default-members = [
+    ".",
+    "test",
 ]
 resolver = "2"
 
