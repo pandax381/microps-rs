@@ -7,7 +7,9 @@ use core::time::Duration;
 use spin::Mutex;
 
 use crate::device::{Device, FAMILY_IP};
-use crate::ether::{EtherAddr, ETHER_ADDR_LEN, ETHER_TYPE_ARP, ETHER_TYPE_IP};
+use crate::ether::{
+    EtherAddr, ETHER_ADDR_ANY, ETHER_ADDR_LEN, ETHER_TYPE_ARP, ETHER_TYPE_IP,
+};
 use crate::ip::{IpAddr, IpIface, IP_ADDR_LEN};
 use crate::{net, time};
 
@@ -40,11 +42,11 @@ struct CacheEntry {
 
 static CACHE: Mutex<Vec<CacheEntry>> = Mutex::new(Vec::new());
 
-fn cache_select(pa: IpAddr) -> Option<EtherAddr> {
+fn cache_select(pa: IpAddr) -> Option<(CacheState, EtherAddr)> {
     let cache = CACHE.lock();
     for entry in cache.iter() {
-        if entry.state == CacheState::Resolved && entry.pa == pa {
-            return Some(entry.ha);
+        if entry.pa == pa {
+            return Some((entry.state, entry.ha));
         }
     }
     None
@@ -100,15 +102,41 @@ fn cache_insert(pa: IpAddr, ha: EtherAddr, state: CacheState) {
     }
 }
 
-pub fn resolve(_iface: &IpIface, pa: IpAddr) -> Result<EtherAddr, ()> {
+fn request(iface: &IpIface, tpa: IpAddr) -> Result<(), ()> {
+    let dev = iface.dev();
+    let mut buf = [0u8; ARP_ETHER_IP_SIZE];
+    buf[0..2].copy_from_slice(&ARP_HRD_ETHER.to_be_bytes());
+    buf[2..4].copy_from_slice(&ARP_PRO_IP.to_be_bytes());
+    buf[4] = ETHER_ADDR_LEN as u8;
+    buf[5] = IP_ADDR_LEN as u8;
+    buf[6..8].copy_from_slice(&ARP_OP_REQUEST.to_be_bytes());
+
+    let my_addr = *dev.addr.lock();
+    buf[8..14].copy_from_slice(&my_addr[..ETHER_ADDR_LEN]);
+    buf[14..18].copy_from_slice(&iface.unicast().0);
+    // tha is left zero (unknown target hardware address).
+    buf[24..28].copy_from_slice(&tpa.0);
+
+    crate::debugf!("dev={}, len={}", dev.name, ARP_ETHER_IP_SIZE);
+    print(&buf);
+
+    dev.output(ETHER_TYPE_ARP, &buf, &dev.broadcast[..ETHER_ADDR_LEN])
+}
+
+pub fn resolve(iface: &IpIface, pa: IpAddr) -> Result<Option<EtherAddr>, ()> {
     match cache_select(pa) {
-        Some(ha) => {
+        Some((CacheState::Resolved, ha)) | Some((CacheState::Static, ha)) => {
             crate::debugf!("RESOLVED: pa={}, ha={}", pa, ha);
-            Ok(ha)
+            Ok(Some(ha))
+        }
+        Some((CacheState::Incomplete, _)) => {
+            crate::debugf!("INCOMPLETE: pa={}", pa);
+            Ok(None)
         }
         None => {
-            crate::errorf!("not found, pa={}", pa);
-            Err(())
+            cache_insert(pa, ETHER_ADDR_ANY, CacheState::Incomplete);
+            request(iface, pa)?;
+            Ok(None)
         }
     }
 }
