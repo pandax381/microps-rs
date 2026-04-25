@@ -187,6 +187,65 @@ impl NetIface for IpIface {
 
 static IFACES: Mutex<Vec<Arc<IpIface>>> = Mutex::new(Vec::new());
 
+pub struct IpRoute {
+    pub network: IpAddr,
+    pub netmask: IpAddr,
+    pub nexthop: IpAddr,
+    pub iface: Arc<IpIface>,
+}
+
+static ROUTES: Mutex<Vec<Arc<IpRoute>>> = Mutex::new(Vec::new());
+
+pub fn route_add(
+    network: IpAddr,
+    netmask: IpAddr,
+    nexthop: IpAddr,
+    iface: Arc<IpIface>,
+) -> Result<(), ()> {
+    let route = Arc::new(IpRoute {
+        network,
+        netmask,
+        nexthop,
+        iface: iface.clone(),
+    });
+    ROUTES.lock().push(route);
+    crate::infof!(
+        "network={}, netmask={}, nexthop={}, dev={}",
+        network,
+        netmask,
+        nexthop,
+        iface.dev.name
+    );
+    Ok(())
+}
+
+pub fn route_lookup(dst: IpAddr) -> Option<Arc<IpRoute>> {
+    let routes = ROUTES.lock();
+    let mut best: Option<Arc<IpRoute>> = None;
+    let mut best_prefix: i32 = -1;
+    for route in routes.iter() {
+        let matches = (0..IP_ADDR_LEN)
+            .all(|i| (dst.0[i] & route.netmask.0[i]) == route.network.0[i]);
+        if matches {
+            let prefix: i32 = route
+                .netmask
+                .0
+                .iter()
+                .map(|b| b.count_ones() as i32)
+                .sum();
+            if prefix > best_prefix {
+                best = Some(route.clone());
+                best_prefix = prefix;
+            }
+        }
+    }
+    best
+}
+
+pub fn set_default_gateway(iface: &Arc<IpIface>, gw: IpAddr) -> Result<(), ()> {
+    route_add(IpAddr::ANY, IpAddr::ANY, gw, iface.clone())
+}
+
 pub fn iface_select(addr: IpAddr) -> Option<Arc<IpIface>> {
     IFACES
         .lock()
@@ -245,21 +304,35 @@ fn output_device(iface: &IpIface, buf: &[u8], target: IpAddr) -> Result<(), ()> 
 
 pub fn output(protocol: u8, data: &[u8], src: IpAddr, dst: IpAddr) -> Result<(), ()> {
     crate::debugf!("{} => {}, protocol={}, len={}", src, dst, protocol, data.len());
-    if src == IpAddr::ANY {
-        crate::errorf!("ip routing does not implement");
+    if src == IpAddr::ANY && dst == IpAddr::BROADCAST {
+        crate::errorf!("source address is required for broadcast");
         return Err(());
     }
-    let iface = match iface_select(src) {
-        Some(i) => i,
+    let route = match route_lookup(dst) {
+        Some(r) => r,
         None => {
-            crate::errorf!("iface not found, src={}", src);
+            crate::errorf!("no route to host, dst={}", dst);
             return Err(());
         }
     };
-    if !iface.contains(dst) && dst != IpAddr::BROADCAST {
-        crate::errorf!("not reached, dst={}", dst);
+    let iface = &route.iface;
+    let nexthop = if route.nexthop != IpAddr::ANY {
+        route.nexthop
+    } else {
+        dst
+    };
+    let src = if src == IpAddr::ANY {
+        iface.unicast
+    } else if src != iface.unicast {
+        crate::errorf!(
+            "source address mismatch, src={}, iface={}",
+            src,
+            iface.unicast
+        );
         return Err(());
-    }
+    } else {
+        src
+    };
     if (iface.dev.mtu as usize) < IP_HDR_SIZE_MIN + data.len() {
         crate::errorf!(
             "too long, dev={}, mtu={} < {}",
@@ -270,9 +343,9 @@ pub fn output(protocol: u8, data: &[u8], src: IpAddr, dst: IpAddr) -> Result<(),
         return Err(());
     }
     let id = crate::platform::random32() as u16;
-    let buf = build_packet(protocol, data, iface.unicast, dst, id)?;
+    let buf = build_packet(protocol, data, src, dst, id)?;
     print(&buf);
-    output_device(&iface, &buf, dst)
+    output_device(iface, &buf, nexthop)
 }
 
 pub fn iface_register(
@@ -296,6 +369,13 @@ pub fn iface_register(
     });
     dev.add_iface(iface.clone())?;
     IFACES.lock().push(iface.clone());
+    let network = IpAddr([
+        unicast.0[0] & netmask.0[0],
+        unicast.0[1] & netmask.0[1],
+        unicast.0[2] & netmask.0[2],
+        unicast.0[3] & netmask.0[3],
+    ]);
+    route_add(network, netmask, IpAddr::ANY, iface.clone())?;
     crate::infof!(
         "dev={}, unicast={}, netmask={}, broadcast={}",
         dev.name,

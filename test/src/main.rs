@@ -17,6 +17,8 @@ use defs::{
     LOOPBACK_IP_ADDR, LOOPBACK_NETMASK, TEST_DATA,
 };
 
+const ICMP_ECHO_DST: &str = "8.8.8.8";
+
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_signum: libc::c_int) {
@@ -37,7 +39,9 @@ fn setup() -> Result<(), ()> {
 
     let mac: EtherAddr = ETHER_TAP_HW_ADDR.parse()?;
     let en = ether_tap::init(ETHER_TAP_NAME, Some(mac))?;
-    ip::iface_register(&en, ETHER_TAP_IP_ADDR, ETHER_TAP_NETMASK)?;
+    let en_iface = ip::iface_register(&en, ETHER_TAP_IP_ADDR, ETHER_TAP_NETMASK)?;
+    let gw: IpAddr = DEFAULT_GATEWAY.parse()?;
+    ip::set_default_gateway(&en_iface, gw)?;
 
     net::run()?;
     Ok(())
@@ -51,7 +55,7 @@ fn cleanup() -> Result<(), ()> {
 fn app_main() -> Result<(), ()> {
     infof!("press Ctrl+C to terminate");
     let src: IpAddr = ETHER_TAP_IP_ADDR.parse()?;
-    let dst: IpAddr = DEFAULT_GATEWAY.parse()?;
+    let dst: IpAddr = ICMP_ECHO_DST.parse()?;
     let id = unsafe { libc::getpid() } as u16;
     let mut seq: u16 = 0;
     while !TERMINATE.load(Ordering::Relaxed) {
