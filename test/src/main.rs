@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use microps::driver::loopback;
 use microps::ether::EtherAddr;
-use microps::ip::{self, IpAddr};
+use microps::ip::{self, IpAddr, IpEndp};
 use microps::platform::driver::ether_tap;
-use microps::{infof, net};
+use microps::{infof, net, udp};
 
 mod defs;
 
@@ -50,10 +50,13 @@ fn cleanup() -> Result<(), ()> {
 }
 
 fn app_main() -> Result<(), ()> {
+    let desc = udp::open().ok_or(())?;
+    udp::bind(desc, IpEndp::new(IpAddr::ANY, 7))?;
     infof!("press Ctrl+C to terminate");
     while !TERMINATE.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
     }
+    udp::close(desc)?;
     infof!("terminate");
     Ok(())
 }

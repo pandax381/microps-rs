@@ -168,6 +168,10 @@ impl<'a> IpHdr<'a> {
     pub fn dst(&self) -> IpAddr {
         IpAddr([self.data[16], self.data[17], self.data[18], self.data[19]])
     }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data[..self.hlen().min(self.data.len())]
+    }
 }
 
 pub struct IpIface {
