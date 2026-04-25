@@ -5,19 +5,16 @@ use std::time::Duration;
 
 use microps::driver::loopback;
 use microps::ether::EtherAddr;
-use microps::icmp::{self, ICMP_TYPE_ECHO};
 use microps::ip::{self, IpAddr};
 use microps::platform::driver::ether_tap;
-use microps::{errorf, infof, net};
+use microps::{infof, net};
 
 mod defs;
 
 use defs::{
     DEFAULT_GATEWAY, ETHER_TAP_HW_ADDR, ETHER_TAP_IP_ADDR, ETHER_TAP_NAME, ETHER_TAP_NETMASK,
-    LOOPBACK_IP_ADDR, LOOPBACK_NETMASK, TEST_DATA,
+    LOOPBACK_IP_ADDR, LOOPBACK_NETMASK,
 };
-
-const ICMP_ECHO_DST: &str = "8.8.8.8";
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 
@@ -54,16 +51,7 @@ fn cleanup() -> Result<(), ()> {
 
 fn app_main() -> Result<(), ()> {
     infof!("press Ctrl+C to terminate");
-    let src: IpAddr = ETHER_TAP_IP_ADDR.parse()?;
-    let dst: IpAddr = ICMP_ECHO_DST.parse()?;
-    let id = unsafe { libc::getpid() } as u16;
-    let mut seq: u16 = 0;
     while !TERMINATE.load(Ordering::Relaxed) {
-        let values = ((id as u32) << 16) | seq as u32;
-        if icmp::output(ICMP_TYPE_ECHO, 0, values, &TEST_DATA[28..], src, dst).is_err() {
-            errorf!("icmp::output() failure");
-        }
-        seq = seq.wrapping_add(1);
         thread::sleep(Duration::from_secs(1));
     }
     infof!("terminate");

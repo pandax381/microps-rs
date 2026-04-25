@@ -76,6 +76,35 @@ impl FromStr for IpAddr {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpEndp {
+    pub addr: IpAddr,
+    pub port: u16,
+}
+
+impl IpEndp {
+    pub fn new(addr: IpAddr, port: u16) -> Self {
+        Self { addr, port }
+    }
+}
+
+impl fmt::Display for IpEndp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.addr, self.port)
+    }
+}
+
+impl FromStr for IpEndp {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (addr_str, port_str) = s.rsplit_once(':').ok_or(())?;
+        let addr: IpAddr = addr_str.parse()?;
+        let port: u16 = port_str.parse().map_err(|_| ())?;
+        Ok(Self { addr, port })
+    }
+}
+
 pub struct IpHdr<'a> {
     data: &'a [u8],
 }
