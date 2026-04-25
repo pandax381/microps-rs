@@ -5,21 +5,25 @@ use std::time::SystemTime;
 
 pub mod driver;
 pub mod intr;
+pub mod timer;
 
 pub fn init() -> Result<(), ()> {
     let mut ts: libc::timespec = unsafe { core::mem::zeroed() };
     unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
     unsafe { libc::srand(ts.tv_nsec as libc::c_uint) };
     intr::init()?;
+    timer::init()?;
     Ok(())
 }
 
 pub fn run() -> Result<(), ()> {
     intr::run()?;
+    timer::run()?;
     Ok(())
 }
 
 pub fn shutdown() {
+    timer::shutdown();
     intr::shutdown();
 }
 

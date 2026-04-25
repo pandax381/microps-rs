@@ -231,8 +231,9 @@ fn output_device(iface: &IpIface, buf: &[u8], target: IpAddr) -> Result<(), ()> 
             let alen = iface.dev.alen as usize;
             hwaddr[..alen].copy_from_slice(&iface.dev.broadcast[..alen]);
         } else {
-            crate::errorf!("ARP does not implement");
-            return Err(());
+            let mac = crate::arp::resolve(iface, target)?;
+            let alen = iface.dev.alen as usize;
+            hwaddr[..alen].copy_from_slice(&mac.0[..alen]);
         }
     }
     iface.dev.output(net::PROTOCOL_TYPE_IP, buf, &hwaddr)

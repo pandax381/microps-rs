@@ -1,9 +1,15 @@
 //! ARP protocol.
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::time::Duration;
+
+use spin::Mutex;
+
 use crate::device::{Device, FAMILY_IP};
 use crate::ether::{EtherAddr, ETHER_ADDR_LEN, ETHER_TYPE_ARP, ETHER_TYPE_IP};
 use crate::ip::{IpAddr, IpIface, IP_ADDR_LEN};
-use crate::net;
+use crate::{net, time};
 
 pub const ARP_HRD_ETHER: u16 = 0x0001;
 pub const ARP_PRO_IP: u16 = ETHER_TYPE_IP;
@@ -13,6 +19,116 @@ pub const ARP_OP_REPLY: u16 = 2;
 
 pub const ARP_HDR_SIZE: usize = 8;
 pub const ARP_ETHER_IP_SIZE: usize = ARP_HDR_SIZE + (ETHER_ADDR_LEN + IP_ADDR_LEN) * 2;
+
+const CACHE_SIZE: usize = 32;
+const CACHE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq)]
+enum CacheState {
+    Incomplete,
+    Resolved,
+    Static,
+}
+
+struct CacheEntry {
+    state: CacheState,
+    pa: IpAddr,
+    ha: EtherAddr,
+    timestamp: Duration,
+}
+
+static CACHE: Mutex<Vec<CacheEntry>> = Mutex::new(Vec::new());
+
+fn cache_select(pa: IpAddr) -> Option<EtherAddr> {
+    let cache = CACHE.lock();
+    for entry in cache.iter() {
+        if entry.state == CacheState::Resolved && entry.pa == pa {
+            return Some(entry.ha);
+        }
+    }
+    None
+}
+
+fn cache_update(pa: IpAddr, ha: EtherAddr) -> bool {
+    let mut cache = CACHE.lock();
+    for entry in cache.iter_mut() {
+        if entry.pa == pa {
+            entry.ha = ha;
+            entry.state = CacheState::Resolved;
+            entry.timestamp = time::now();
+            crate::debugf!("UPDATE: pa={}, ha={}", pa, ha);
+            return true;
+        }
+    }
+    false
+}
+
+fn cache_insert(pa: IpAddr, ha: EtherAddr, state: CacheState) {
+    let mut cache = CACHE.lock();
+    let now = time::now();
+    if cache.len() < CACHE_SIZE {
+        cache.push(CacheEntry {
+            state,
+            pa,
+            ha,
+            timestamp: now,
+        });
+        crate::debugf!("INSERT: pa={}, ha={}", pa, ha);
+        return;
+    }
+    let mut oldest: Option<usize> = None;
+    for (i, entry) in cache.iter().enumerate() {
+        if entry.state == CacheState::Static {
+            continue;
+        }
+        match oldest {
+            Some(j) if cache[j].timestamp <= entry.timestamp => {}
+            _ => oldest = Some(i),
+        }
+    }
+    if let Some(i) = oldest {
+        cache[i] = CacheEntry {
+            state,
+            pa,
+            ha,
+            timestamp: now,
+        };
+        crate::debugf!("INSERT: pa={}, ha={}", pa, ha);
+    } else {
+        crate::errorf!("cache full, pa={}, ha={}", pa, ha);
+    }
+}
+
+pub fn resolve(_iface: &IpIface, pa: IpAddr) -> Result<EtherAddr, ()> {
+    match cache_select(pa) {
+        Some(ha) => {
+            crate::debugf!("RESOLVED: pa={}, ha={}", pa, ha);
+            Ok(ha)
+        }
+        None => {
+            crate::errorf!("not found, pa={}", pa);
+            Err(())
+        }
+    }
+}
+
+fn on_timer() {
+    let now = time::now();
+    let mut cache = CACHE.lock();
+    let mut i = 0;
+    while i < cache.len() {
+        let entry = &cache[i];
+        if entry.state != CacheState::Static
+            && now.saturating_sub(entry.timestamp) >= CACHE_TIMEOUT
+        {
+            crate::debugf!("DELETE: pa={}, ha={}", entry.pa, entry.ha);
+            cache.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
 
 pub struct ArpHdr<'a> {
     data: &'a [u8],
@@ -170,6 +286,8 @@ fn input(data: &[u8], dev: &Device) {
 
     print(data);
 
+    let merge = cache_update(arp.spa(), arp.sha());
+    
     let iface_any = match dev.get_iface(FAMILY_IP) {
         Some(i) => i,
         None => {
@@ -183,6 +301,9 @@ fn input(data: &[u8], dev: &Device) {
     };
 
     if arp.tpa() == iface.unicast() {
+        if !merge {
+            cache_insert(arp.spa(), arp.sha(), CacheState::Resolved);
+        }
         if hdr.op() == ARP_OP_REQUEST {
             let _ = reply(dev, arp.sha(), arp.spa(), iface.unicast());
         }
@@ -191,5 +312,6 @@ fn input(data: &[u8], dev: &Device) {
 
 pub fn init() -> Result<(), ()> {
     net::register_protocol(ETHER_TYPE_ARP, input)?;
+    crate::platform::timer::register(Duration::from_secs(1), Box::new(on_timer))?;
     Ok(())
 }
