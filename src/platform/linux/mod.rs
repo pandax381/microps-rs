@@ -6,6 +6,7 @@ use std::time::SystemTime;
 pub mod driver;
 pub mod intr;
 pub mod softirq;
+pub mod task;
 pub mod timer;
 
 pub fn init() -> Result<(), ()> {
@@ -15,6 +16,7 @@ pub fn init() -> Result<(), ()> {
     intr::init()?;
     softirq::init()?;
     timer::init()?;
+    task::init()?;
     Ok(())
 }
 
@@ -22,12 +24,14 @@ pub fn run() -> Result<(), ()> {
     intr::run()?;
     softirq::run()?;
     timer::run()?;
+    task::run()?;
     Ok(())
 }
 
 pub fn shutdown() {
     timer::shutdown();
     softirq::shutdown();
+    task::shutdown();
     intr::shutdown();
 }
 

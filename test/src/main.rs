@@ -1,13 +1,16 @@
+use std::io::Read;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
 
 use microps::driver::loopback;
 use microps::ether::EtherAddr;
 use microps::ip::{self, IpAddr, IpEndp};
 use microps::platform::driver::ether_tap;
-use microps::{infof, net, udp};
+use microps::platform::intr;
+use microps::udp::{self, RecvError, UdpDesc};
+use microps::util::HexDump;
+use microps::{debugf, errorf, infof, net, printf, warnf};
 
 mod defs;
 
@@ -20,6 +23,7 @@ static TERMINATE: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_signum: libc::c_int) {
     TERMINATE.store(true, Ordering::Relaxed);
+    intr::raise(libc::SIGUSR2 as intr::IrqNumber);
 }
 
 fn setup() -> Result<(), ()> {
@@ -49,15 +53,48 @@ fn cleanup() -> Result<(), ()> {
     Ok(())
 }
 
+fn receiver(desc: UdpDesc) {
+    debugf!("running...");
+    let mut buf = [0u8; 128];
+    while !TERMINATE.load(Ordering::Relaxed) {
+        match udp::recvfrom(desc, &mut buf) {
+            Ok((remote, n)) => {
+                infof!("{} bytes data receive from {}", n, remote);
+                printf!("{}", HexDump(&buf[..n]));
+            }
+            Err(RecvError::Interrupted) => continue,
+            Err(RecvError::NotBound) => {
+                warnf!("udp::recvfrom() failure");
+                break;
+            }
+        }
+    }
+    debugf!("terminate");
+}
+
 fn app_main() -> Result<(), ()> {
     let desc = udp::open().ok_or(())?;
-    udp::bind(desc, IpEndp::new(IpAddr::ANY, 7))?;
-    infof!("press Ctrl+C to terminate");
+    let remote: IpEndp = "192.0.2.1:10007".parse()?;
+
+    let handle = thread::spawn(move || receiver(desc));
+
+    debugf!("press Ctrl+C to terminate");
+    let mut stdin = std::io::stdin();
+    let mut buf = [0u8; 128];
     while !TERMINATE.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_secs(1));
+        let Ok(n) = stdin.read(&mut buf) else { break; };
+        if n == 0 { break; }
+        infof!("{} bytes data send to {}", n, remote);
+        printf!("{}", HexDump(&buf[..n]));
+        if udp::sendto(desc, &buf[..n], remote).is_err() {
+            errorf!("udp::sendto() failure");
+            break;
+        }
     }
+
     udp::close(desc)?;
-    infof!("terminate");
+    let _ = handle.join();
+    debugf!("terminate");
     Ok(())
 }
 

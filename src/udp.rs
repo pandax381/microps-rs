@@ -1,17 +1,29 @@
 //! UDP protocol.
 
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use spin::Mutex;
 
 use crate::ip::{self, IpAddr, IpEndp, IpHdr, IpIface, IP_PROTOCOL_UDP};
+use crate::platform::task::{self, Task, WaitResult};
 use crate::util;
 
 pub const UDP_HDR_SIZE: usize = 8;
 const UDP_PSEUDO_HDR_SIZE: usize = 12;
 
 pub const PCB_SIZE_MAX: usize = 16;
+
+const DYNAMIC_PORT_MIN: u16 = 49152;
+const DYNAMIC_PORT_MAX: u16 = 65535;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvError {
+    NotBound,
+    Interrupted,
+}
 
 fn build_pseudo_header(src: IpAddr, dst: IpAddr, udp_len: u16) -> [u8; UDP_PSEUDO_HDR_SIZE] {
     let mut buf = [0u8; UDP_PSEUDO_HDR_SIZE];
@@ -60,6 +72,7 @@ struct UdpQueueEntry {
 struct UdpPcb {
     local: IpEndp,
     queue: VecDeque<UdpQueueEntry>,
+    task: Arc<Task>,
 }
 
 impl UdpPcb {
@@ -67,6 +80,7 @@ impl UdpPcb {
         Self {
             local: IpEndp::new(IpAddr::ANY, 0),
             queue: VecDeque::new(),
+            task: task::new_task(),
         }
     }
 }
@@ -91,11 +105,10 @@ fn pcb_alloc(pcbs: &mut Vec<Option<UdpPcb>>) -> Option<UdpDesc> {
 }
 
 fn pcb_release(pcbs: &mut [Option<UdpPcb>], desc: UdpDesc) -> Result<(), ()> {
-    let slot = pcbs.get_mut(desc).ok_or(())?;
-    if slot.is_none() {
-        return Err(());
-    }
-    *slot = None;
+    let pcb = pcb_get_mut(pcbs, desc).ok_or(())?;
+    let task = pcb.task.clone();
+    *pcbs.get_mut(desc).unwrap() = None;
+    task.notify();
     Ok(())
 }
 
@@ -232,7 +245,107 @@ fn input(hdr: &IpHdr<'_>, data: &[u8], iface: &IpIface) {
             src,
             pcb.queue.len()
         );
+        let task = pcb.task.clone();
+        drop(pcbs);
+        task.notify();
     }
+}
+
+pub fn recvfrom(desc: UdpDesc, buf: &mut [u8]) -> Result<(IpEndp, usize), RecvError> {
+    loop {
+        let (task, snapshot) = {
+            let mut pcbs = PCBS.lock();
+            let pcb = pcb_get_mut(&mut pcbs, desc).ok_or_else(|| {
+                crate::errorf!("pcb not found, desc={}", desc);
+                RecvError::NotBound
+            })?;
+            if let Some(entry) = pcb.queue.pop_front() {
+                let n = buf.len().min(entry.data.len());
+                buf[..n].copy_from_slice(&entry.data[..n]);
+                crate::debugf!(
+                    "queue pop: desc={}, remote={}, len={}",
+                    desc,
+                    entry.remote,
+                    n
+                );
+                return Ok((entry.remote, n));
+            }
+            (pcb.task.clone(), pcb.task.snapshot())
+        };
+        match task.wait_after(snapshot) {
+            WaitResult::Notified => continue,
+            WaitResult::Interrupted => return Err(RecvError::Interrupted),
+        }
+    }
+}
+
+fn assign_dynamic_port(
+    pcbs: &mut Vec<Option<UdpPcb>>,
+    desc: UdpDesc,
+    local_addr: IpAddr,
+) -> Result<u16, ()> {
+    for port in DYNAMIC_PORT_MIN..=DYNAMIC_PORT_MAX {
+        if pcb_select(pcbs, IpEndp::new(local_addr, port)).is_none() {
+            pcbs[desc].as_mut().unwrap().local.port = port;
+            return Ok(port);
+        }
+    }
+    crate::errorf!("no dynamic port available");
+    Err(())
+}
+
+fn output(src: IpEndp, dst: IpEndp, data: &[u8]) -> Result<usize, ()> {
+    let total = UDP_HDR_SIZE + data.len();
+    if total > u16::MAX as usize {
+        crate::errorf!("too long, len={}", total);
+        return Err(());
+    }
+    let mut buf = vec![0u8; total];
+    buf[0..2].copy_from_slice(&src.port.to_be_bytes());
+    buf[2..4].copy_from_slice(&dst.port.to_be_bytes());
+    buf[4..6].copy_from_slice(&(total as u16).to_be_bytes());
+    buf[UDP_HDR_SIZE..].copy_from_slice(data);
+
+    let pseudo = build_pseudo_header(src.addr, dst.addr, total as u16);
+    let init = !util::cksum16(&pseudo, 0) as u32;
+    let sum = util::cksum16(&buf, init);
+    let sum = if sum == 0 { 0xffff } else { sum };
+    buf[6..8].copy_from_slice(&sum.to_ne_bytes());
+
+    crate::debugf!("{} => {}, len={}", src, dst, total);
+    print(&buf);
+
+    ip::output(IP_PROTOCOL_UDP, &buf, src.addr, dst.addr)?;
+    Ok(data.len())
+}
+
+pub fn sendto(desc: UdpDesc, data: &[u8], remote: IpEndp) -> Result<usize, ()> {
+    let local = {
+        let mut pcbs = PCBS.lock();
+        if pcb_get_mut(&mut pcbs, desc).is_none() {
+            crate::errorf!("pcb not found, desc={}", desc);
+            return Err(());
+        }
+        let local_addr = pcbs[desc].as_ref().unwrap().local.addr;
+        let local_port = pcbs[desc].as_ref().unwrap().local.port;
+        let port = if local_port == 0 {
+            assign_dynamic_port(&mut pcbs, desc, local_addr)?
+        } else {
+            local_port
+        };
+        IpEndp::new(local_addr, port)
+    };
+
+    let src_addr = if local.addr == IpAddr::ANY {
+        let route = ip::route_lookup(remote.addr).ok_or_else(|| {
+            crate::errorf!("no route to {}", remote.addr);
+        })?;
+        route.iface.unicast()
+    } else {
+        local.addr
+    };
+
+    output(IpEndp::new(src_addr, local.port), remote, data)
 }
 
 pub fn init() -> Result<(), ()> {
