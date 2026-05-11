@@ -3,11 +3,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use microps::driver::loopback;
 use microps::ether::EtherAddr;
-use microps::ip::{self, IpAddr, IpEndp};
+use microps::ip::{self, IpAddr};
 use microps::platform::driver::ether_tap;
 use microps::platform::intr;
+use microps::sock::{self, SocketAddr};
 use microps::util::HexDump;
-use microps::{debugf, infof, net, printf, tcp};
+use microps::{debugf, errorf, infof, net, printf, warnf};
 
 mod defs;
 
@@ -51,36 +52,61 @@ fn cleanup() -> Result<(), ()> {
 }
 
 fn app_main() -> Result<(), ()> {
-    let local: IpEndp = "0.0.0.0:7".parse()?;
-    let desc = tcp::socket()?;
-    if tcp::bind(desc, local).is_err() {
-        let _ = tcp::close(desc);
+    let local: SocketAddr = "0.0.0.0:7".parse()?;
+    let soc = sock::open(sock::AF_INET, sock::SOCK_STREAM)?;
+    if sock::bind(soc, local).is_err() {
+        errorf!("sock::bind() failure");
+        let _ = sock::close(soc);
         return Err(());
     }
-    if tcp::listen(desc, 1).is_err() {
-        let _ = tcp::close(desc);
+    if sock::listen(soc, 1).is_err() {
+        errorf!("sock::listen() failure");
+        let _ = sock::close(soc);
         return Err(());
     }
-    let (new_desc, remote) = match tcp::accept(desc) {
-        Ok(v) => v,
-        Err(()) => return Err(()),
-    };
-    debugf!("connection from {}, desc={}", remote, new_desc);
     debugf!("press Ctrl+C to terminate");
-    let mut buf = [0u8; 128];
     while !TERMINATE.load(Ordering::Relaxed) {
-        let n = match tcp::receive(new_desc, &mut buf) {
-            Ok(n) if n > 0 => n,
-            _ => break,
+        let (acc, remote) = match sock::accept(soc) {
+            Ok(v) => v,
+            Err(()) => {
+                if TERMINATE.load(Ordering::Relaxed) {
+                    warnf!("sock::accept() interrupted");
+                    break;
+                }
+                errorf!("sock::accept() failure");
+                break;
+            }
         };
-        infof!("{} bytes data received", n);
-        printf!("{}", HexDump(&buf[..n]));
-        let _ = tcp::send(new_desc, &buf[..n]);
+        debugf!("connection accepted, remote={}", remote);
+        conn_main(acc);
     }
-    let _ = tcp::close(new_desc);
-    let _ = tcp::close(desc);
+    let _ = sock::close(soc);
     debugf!("terminate");
     Ok(())
+}
+
+fn conn_main(soc: sock::SockDesc) {
+    let mut buf = [0u8; 128];
+    loop {
+        let n = match sock::recv(soc, &mut buf) {
+            Ok(0) => {
+                debugf!("connection closed");
+                break;
+            }
+            Ok(n) => n,
+            Err(()) => {
+                errorf!("sock::recv() failure");
+                break;
+            }
+        };
+        infof!("{} bytes received", n);
+        printf!("{}", HexDump(&buf[..n]));
+        if sock::send(soc, &buf[..n]).is_err() {
+            errorf!("sock::send() failure");
+            break;
+        }
+    }
+    let _ = sock::close(soc);
 }
 
 fn main() -> ExitCode {
