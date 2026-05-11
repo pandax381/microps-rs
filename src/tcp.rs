@@ -28,6 +28,7 @@ pub const PCB_SIZE_MAX: usize = 16;
 const RECV_BUF_SIZE: usize = 65535;
 const TCP_DEFAULT_RTO: Duration = Duration::from_micros(200_000);
 const TCP_RETRANS_DEADLINE: Duration = Duration::from_secs(12);
+const TCP_TIMEWAIT_SEC: Duration = Duration::from_secs(30);
 const TCP_TIMER_INTERVAL: Duration = Duration::from_millis(100);
 const DYNAMIC_PORT_MIN: u16 = 49152;
 const DYNAMIC_PORT_MAX: u16 = 65535;
@@ -269,6 +270,7 @@ struct TcpPcb {
     mss: u16,
     buf: Vec<u8>,
     queue: VecDeque<TcpQueueEntry>,
+    tw_timer: Duration,
     task: Arc<Task>,
 }
 
@@ -285,6 +287,7 @@ impl TcpPcb {
             mss: 0,
             buf: Vec::new(),
             queue: VecDeque::new(),
+            tw_timer: Duration::ZERO,
             task: task::new_task(),
         }
     }
@@ -400,13 +403,31 @@ fn retrans_emit(pcbs: &mut [Option<TcpPcb>], desc: usize) {
     }
 }
 
+fn set_timewait_timer(pcb: &mut TcpPcb) {
+    pcb.tw_timer = crate::time::now() + TCP_TIMEWAIT_SEC;
+    crate::debugf!("start time_wait timer: {} seconds", TCP_TIMEWAIT_SEC.as_secs());
+}
+
 fn on_timer() {
     let mut pcbs = PCBS.lock();
+    let now = crate::time::now();
     let len = pcbs.len();
     for desc in 0..len {
-        if pcbs[desc].is_some() {
-            retrans_emit(&mut pcbs, desc);
+        if pcbs[desc].is_none() {
+            continue;
         }
+        let state = pcbs[desc].as_ref().unwrap().state;
+        if state == TcpState::TimeWait {
+            let tw_timer = pcbs[desc].as_ref().unwrap().tw_timer;
+            if now > tw_timer {
+                crate::debugf!("timewait has elapsed, desc={}", desc);
+                let pcb = pcbs[desc].as_mut().unwrap();
+                transition(pcb, desc, TcpState::Closed);
+                let _ = pcb_release(&mut pcbs, desc);
+                continue;
+            }
+        }
+        retrans_emit(&mut pcbs, desc);
     }
 }
 
@@ -645,7 +666,13 @@ fn segment_arrives(
             return;
         }
     }
-    if matches!(pcb.state, TcpState::Established | TcpState::CloseWait) {
+    if matches!(
+        pcb.state,
+        TcpState::Established
+            | TcpState::CloseWait
+            | TcpState::FinWait1
+            | TcpState::FinWait2
+    ) {
         if pcb.snd.una < seg.ack && seg.ack <= pcb.snd.nxt {
             pcb.snd.una = seg.ack;
             retrans_queue_cleanup(pcb);
@@ -663,17 +690,30 @@ fn segment_arrives(
             let _ = output(pcb, TCP_FLG_ACK, &[]);
             return;
         }
+        // state-specific post-processing
+        if pcb.state == TcpState::FinWait1 && seg.ack == pcb.snd.nxt {
+            transition(pcb, desc, TcpState::FinWait2);
+        }
+        // FinWait2 / CloseWait: nothing extra
     } else if pcb.state == TcpState::LastAck {
         if seg.ack == pcb.snd.nxt {
             transition(pcb, desc, TcpState::Closed);
             let _ = pcb_release(pcbs, desc);
         }
         return;
+    } else if pcb.state == TcpState::TimeWait {
+        if flag_isset(flags, TCP_FLG_FIN) {
+            set_timewait_timer(pcb);
+        }
     }
     // 6th URG bit (ignore)
     // 7th process segment text (ESTABLISHED)
     let pcb = pcbs[desc].as_mut().unwrap();
-    if pcb.state == TcpState::Established && !data.is_empty() {
+    if matches!(
+        pcb.state,
+        TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
+    ) && !data.is_empty()
+    {
         let len = data.len();
         if pcb.rcv.nxt != seg.seq || (pcb.rcv.wnd as usize) < len {
             // Out of order or larger than window: re-ack to request the optimal segment.
@@ -703,7 +743,14 @@ fn segment_arrives(
                 let task = pcb.task.clone();
                 task.notify();
             }
-            // CLOSE_WAIT / LAST_ACK: remain in current state
+            TcpState::FinWait1 => {
+                // TODO: simultaneous close (step 28)
+            }
+            TcpState::FinWait2 => {
+                transition(pcb, desc, TcpState::TimeWait);
+                set_timewait_timer(pcb);
+            }
+            // CLOSE_WAIT / LAST_ACK / TIME_WAIT: remain in current state
             _ => {}
         }
     }
@@ -907,9 +954,10 @@ pub fn close(desc: TcpDesc) -> Result<(), ()> {
             transition(pcb, desc, TcpState::Closed);
         }
         TcpState::SynReceived | TcpState::Established => {
-            // Tentative: send RST. Proper active close lands in step 27.
-            let _ = output(pcb, TCP_FLG_RST, &[]);
-            transition(pcb, desc, TcpState::Closed);
+            crate::debugf!("close connection");
+            let _ = output(pcb, TCP_FLG_ACK | TCP_FLG_FIN, &[]);
+            pcb.snd.nxt = pcb.snd.nxt.wrapping_add(1);
+            transition(pcb, desc, TcpState::FinWait1);
         }
         TcpState::CloseWait => {
             crate::debugf!("close connection");
@@ -917,7 +965,10 @@ pub fn close(desc: TcpDesc) -> Result<(), ()> {
             pcb.snd.nxt = pcb.snd.nxt.wrapping_add(1);
             transition(pcb, desc, TcpState::LastAck);
         }
-        TcpState::LastAck => {
+        TcpState::FinWait1
+        | TcpState::FinWait2
+        | TcpState::LastAck
+        | TcpState::TimeWait => {
             crate::errorf!("connection closing");
             return Err(());
         }
@@ -945,7 +996,10 @@ pub fn send(desc: TcpDesc, data: &[u8]) -> Result<usize, ()> {
             })?;
             match pcb.state {
                 TcpState::Established | TcpState::CloseWait => {}
-                TcpState::LastAck => {
+                TcpState::FinWait1
+                | TcpState::FinWait2
+                | TcpState::LastAck
+                | TcpState::TimeWait => {
                     crate::errorf!("connection closing");
                     return Err(());
                 }
@@ -993,7 +1047,7 @@ pub fn receive(desc: TcpDesc, buf: &mut [u8]) -> Result<usize, ()> {
                 crate::errorf!("pcb not found, desc={}", desc);
             })?;
             match pcb.state {
-                TcpState::Established => {
+                TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2 => {
                     if pcb.buf.is_empty() {
                         Some((pcb.task.clone(), pcb.task.snapshot()))
                     } else {
@@ -1015,7 +1069,7 @@ pub fn receive(desc: TcpDesc, buf: &mut [u8]) -> Result<usize, ()> {
                     pcb.rcv.wnd += n as u16;
                     return Ok(n);
                 }
-                TcpState::LastAck => {
+                TcpState::LastAck | TcpState::TimeWait => {
                     crate::debugf!("connection closing");
                     return Ok(0);
                 }
