@@ -50,6 +50,12 @@ pub enum TcpState {
     TimeWait,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpMode {
+    Rfc,
+    Socket,
+}
+
 impl fmt::Display for TcpState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -261,6 +267,7 @@ struct TcpQueueEntry {
 #[allow(dead_code)]
 struct TcpPcb {
     state: TcpState,
+    mode: TcpMode,
     local: IpEndp,
     remote: IpEndp,
     snd: SndVars,
@@ -271,6 +278,9 @@ struct TcpPcb {
     buf: Vec<u8>,
     queue: VecDeque<TcpQueueEntry>,
     tw_timer: Duration,
+    parent_desc: Option<TcpDesc>,
+    backlog: VecDeque<TcpDesc>,
+    backlog_max: usize,
     task: Arc<Task>,
 }
 
@@ -278,6 +288,7 @@ impl TcpPcb {
     fn empty() -> Self {
         Self {
             state: TcpState::Closed,
+            mode: TcpMode::Rfc,
             local: IpEndp::new(IpAddr::ANY, 0),
             remote: IpEndp::new(IpAddr::ANY, 0),
             snd: SndVars::default(),
@@ -288,6 +299,9 @@ impl TcpPcb {
             buf: Vec::new(),
             queue: VecDeque::new(),
             tw_timer: Duration::ZERO,
+            parent_desc: None,
+            backlog: VecDeque::new(),
+            backlog_max: 0,
             task: task::new_task(),
         }
     }
@@ -311,6 +325,34 @@ fn pcb_alloc(pcbs: &mut Vec<Option<TcpPcb>>) -> Option<usize> {
 }
 
 fn pcb_release(pcbs: &mut [Option<TcpPcb>], desc: usize) -> Result<(), ()> {
+    // Drain the backlog so any queued accepted PCBs are also torn down.
+    let backlog: Vec<TcpDesc> = {
+        let pcb = pcbs.get_mut(desc).and_then(|s| s.as_mut()).ok_or(())?;
+        core::mem::take(&mut pcb.backlog).into_iter().collect()
+    };
+    for backlog_desc in backlog {
+        let needs_release = match pcbs
+            .get_mut(backlog_desc)
+            .and_then(|s| s.as_mut())
+        {
+            Some(p) => {
+                crate::debugf!(
+                    "release backlog entry, desc={}, state={}",
+                    backlog_desc,
+                    p.state
+                );
+                if p.state != TcpState::Closed {
+                    let _ = output(p, TCP_FLG_RST, &[]);
+                    transition(p, backlog_desc, TcpState::Closed);
+                }
+                true
+            }
+            None => false,
+        };
+        if needs_release {
+            let _ = pcb_release(pcbs, backlog_desc);
+        }
+    }
     let pcb = pcbs.get_mut(desc).and_then(|s| s.as_mut()).ok_or(())?;
     let task = pcb.task.clone();
     *pcbs.get_mut(desc).unwrap() = None;
@@ -551,7 +593,31 @@ fn segment_arrives(
             // 3rd check for an SYN
             if flag_isset(flags, TCP_FLG_SYN) {
                 // ignore: security/compartment check
-                let pcb = pcbs[desc].as_mut().unwrap();
+                let is_socket = pcbs[desc].as_ref().unwrap().mode == TcpMode::Socket;
+                let target_desc = if is_socket {
+                    let pcb = pcbs[desc].as_ref().unwrap();
+                    if pcb.backlog.len() >= pcb.backlog_max {
+                        crate::warnf!("backlog is full");
+                        return;
+                    }
+                    let new_desc = match pcb_alloc(pcbs) {
+                        Some(d) => d,
+                        None => {
+                            crate::errorf!("pcb_alloc() failure");
+                            return;
+                        }
+                    };
+                    crate::debugf!(
+                        "allocate PCB for new connection, desc={}, state={}",
+                        new_desc,
+                        pcbs[new_desc].as_ref().unwrap().state,
+                    );
+                    pcbs[new_desc].as_mut().unwrap().parent_desc = Some(desc);
+                    new_desc
+                } else {
+                    desc
+                };
+                let pcb = pcbs[target_desc].as_mut().unwrap();
                 pcb.local = local;
                 pcb.remote = remote;
                 pcb.rcv.wnd = RECV_BUF_SIZE as u16;
@@ -561,7 +627,7 @@ fn segment_arrives(
                 let _ = output(pcb, TCP_FLG_SYN | TCP_FLG_ACK, &[]);
                 pcb.snd.nxt = pcb.iss.wrapping_add(1);
                 pcb.snd.una = pcb.iss;
-                transition(pcb, desc, TcpState::SynReceived);
+                transition(pcb, target_desc, TcpState::SynReceived);
                 // ignore: Note that any other incoming control or data
                 // (combined with SYN) will be processed in the SYN-RECEIVED state,
                 // but processing of SYN and ACK should not be repeated
@@ -699,12 +765,14 @@ fn segment_arrives(
     if !flag_isset(flags, TCP_FLG_ACK) {
         return;
     }
+    let mut parent_to_notify: Option<TcpDesc> = None;
     let pcb = pcbs[desc].as_mut().unwrap();
     if pcb.state == TcpState::SynReceived {
         if pcb.snd.una <= seg.ack && seg.ack <= pcb.snd.nxt {
             transition(pcb, desc, TcpState::Established);
             let task = pcb.task.clone();
             task.notify();
+            parent_to_notify = pcb.parent_desc;
             // fall through to ESTABLISHED
         } else {
             let _ = output_segment(seg.ack, 0, TCP_FLG_RST, 0, &[], local, remote);
@@ -756,6 +824,13 @@ fn segment_arrives(
     } else if pcb.state == TcpState::TimeWait {
         if flag_isset(flags, TCP_FLG_FIN) {
             set_timewait_timer(pcb);
+        }
+    }
+    if let Some(parent_desc) = parent_to_notify {
+        if let Some(parent) = pcbs.get_mut(parent_desc).and_then(|s| s.as_mut()) {
+            parent.backlog.push_back(desc);
+            let parent_task = parent.task.clone();
+            parent_task.notify();
         }
     }
     // 6th URG bit (ignore)
@@ -1145,6 +1220,213 @@ pub fn receive(desc: TcpDesc, buf: &mut [u8]) -> Result<usize, ()> {
             }
         }
     }
+}
+
+pub fn socket() -> Result<TcpDesc, ()> {
+    let mut pcbs = PCBS.lock();
+    let desc = pcb_alloc(&mut pcbs).ok_or_else(|| {
+        crate::errorf!("pcb_alloc() failure");
+    })?;
+    let pcb = pcb_get_mut(&mut pcbs, desc).unwrap();
+    pcb.mode = TcpMode::Socket;
+    crate::debugf!("desc={}", desc);
+    Ok(desc)
+}
+
+pub fn bind(desc: TcpDesc, local: IpEndp) -> Result<(), ()> {
+    let mut pcbs = PCBS.lock();
+    let state = match pcbs.get(desc).and_then(|s| s.as_ref()) {
+        Some(p) => p.state,
+        None => {
+            crate::errorf!("pcb not found, desc={}", desc);
+            return Err(());
+        }
+    };
+    if local.port == 0 {
+        crate::errorf!("invalid port");
+        return Err(());
+    }
+    if state != TcpState::Closed {
+        crate::errorf!("pcb is not CLOSED state");
+        return Err(());
+    }
+    let remote = IpEndp::new(IpAddr::ANY, 0);
+    if let Some(exist) = pcb_select(&pcbs, local, remote) {
+        let exist_local = pcbs[exist].as_ref().unwrap().local;
+        crate::errorf!("already bound, exist={}", exist_local);
+        return Err(());
+    }
+    pcbs[desc].as_mut().unwrap().local = local;
+    crate::debugf!("success, local={}", local);
+    Ok(())
+}
+
+pub fn listen(desc: TcpDesc, backlog: usize) -> Result<(), ()> {
+    let mut pcbs = PCBS.lock();
+    let pcb = pcb_get_mut(&mut pcbs, desc).ok_or_else(|| {
+        crate::errorf!("pcb not found, desc={}", desc);
+    })?;
+    if pcb.local.port == 0 {
+        crate::errorf!("pcb is not bound");
+        return Err(());
+    }
+    if pcb.state != TcpState::Closed {
+        crate::errorf!("pcb is not CLOSED state");
+        return Err(());
+    }
+    pcb.backlog_max = backlog;
+    transition(pcb, desc, TcpState::Listen);
+    Ok(())
+}
+
+pub fn accept(desc: TcpDesc) -> Result<(TcpDesc, IpEndp), ()> {
+    loop {
+        let wait = {
+            let mut pcbs = PCBS.lock();
+            let state = match pcbs.get(desc).and_then(|s| s.as_ref()) {
+                Some(p) => p.state,
+                None => {
+                    crate::errorf!("pcb not found, desc={}", desc);
+                    return Err(());
+                }
+            };
+            if state != TcpState::Listen {
+                crate::errorf!("not in LISTEN state");
+                return Err(());
+            }
+            let popped = pcbs[desc].as_mut().unwrap().backlog.pop_front();
+            if let Some(new_desc) = popped {
+                if pcbs.get(new_desc).and_then(|s| s.as_ref()).is_none() {
+                    crate::debugf!("released, desc={}", new_desc);
+                    continue;
+                }
+                let remote = pcbs[new_desc].as_ref().unwrap().remote;
+                let route = ip::route_lookup(remote.addr).ok_or_else(|| {
+                    crate::errorf!("iface not found");
+                })?;
+                let mtu = route.iface.dev().mtu as usize;
+                let new_pcb = pcbs[new_desc].as_mut().unwrap();
+                new_pcb.mss = (mtu - IP_HDR_SIZE_MIN - TCP_HDR_SIZE) as u16;
+                crate::debugf!(
+                    "success, desc={}, local={}, remote={}",
+                    new_desc,
+                    new_pcb.local,
+                    remote
+                );
+                return Ok((new_desc, remote));
+            }
+            let pcb = pcbs[desc].as_ref().unwrap();
+            (pcb.task.clone(), pcb.task.snapshot())
+        };
+        match wait.0.wait_after(wait.1) {
+            WaitResult::Notified => continue,
+            WaitResult::Interrupted => {
+                crate::debugf!("interrupted");
+                return Err(());
+            }
+        }
+    }
+}
+
+pub fn connect(desc: TcpDesc, remote: IpEndp) -> Result<(), ()> {
+    {
+        let mut pcbs = PCBS.lock();
+        let pcb = pcb_get_mut(&mut pcbs, desc).ok_or_else(|| {
+            crate::errorf!("pcb not found, desc={}", desc);
+        })?;
+        let mut local = pcb.local;
+        crate::debugf!("local={}, remote={}", local, remote);
+        if local.addr == IpAddr::ANY {
+            let Some(route) = ip::route_lookup(remote.addr) else {
+                crate::errorf!(
+                    "iface not found that can reach remote address, addr={}",
+                    remote.addr
+                );
+                return Err(());
+            };
+            local.addr = route.iface.unicast();
+            crate::debugf!("select local address, addr={}", local.addr);
+        }
+        if local.port == 0 {
+            let mut assigned = None;
+            for port in DYNAMIC_PORT_MIN..=DYNAMIC_PORT_MAX {
+                let candidate = IpEndp::new(local.addr, port);
+                if pcb_select(&pcbs, candidate, remote).is_none() {
+                    assigned = Some(port);
+                    break;
+                }
+            }
+            match assigned {
+                Some(port) => {
+                    local.port = port;
+                    crate::debugf!("dynamic assign local port, port={}", port);
+                }
+                None => {
+                    crate::errorf!(
+                        "failed to dynamic assign local port, addr={}",
+                        local.addr
+                    );
+                    return Err(());
+                }
+            }
+        }
+        if pcb_select(&pcbs, local, remote).is_some() {
+            crate::errorf!("address already in use");
+            return Err(());
+        }
+        let pcb = pcb_get_mut(&mut pcbs, desc).unwrap();
+        pcb.local = local;
+        pcb.remote = remote;
+        pcb.rcv.wnd = RECV_BUF_SIZE as u16;
+        pcb.iss = crate::platform::random32();
+        if output(pcb, TCP_FLG_SYN, &[]).is_err() {
+            crate::errorf!("tcp::output() failure");
+            transition(pcb, desc, TcpState::Closed);
+            return Err(());
+        }
+        pcb.snd.una = pcb.iss;
+        pcb.snd.nxt = pcb.iss.wrapping_add(1);
+        transition(pcb, desc, TcpState::SynSent);
+    }
+
+    // Wait for state to become ESTABLISHED (or fail).
+    loop {
+        let (task, snapshot) = {
+            let mut pcbs = PCBS.lock();
+            let pcb = pcb_get_mut(&mut pcbs, desc).ok_or(())?;
+            match pcb.state {
+                TcpState::Established => break,
+                TcpState::Listen | TcpState::SynReceived | TcpState::SynSent => {
+                    (pcb.task.clone(), pcb.task.snapshot())
+                }
+                other => {
+                    crate::errorf!("open error: state={}", other);
+                    transition(pcb, desc, TcpState::Closed);
+                    return Err(());
+                }
+            }
+        };
+        match task.wait_after(snapshot) {
+            WaitResult::Notified => continue,
+            WaitResult::Interrupted => {
+                crate::debugf!("interrupted");
+                let mut pcbs = PCBS.lock();
+                if let Some(pcb) = pcb_get_mut(&mut pcbs, desc) {
+                    transition(pcb, desc, TcpState::Closed);
+                }
+                return Err(());
+            }
+        }
+    }
+    let mut pcbs = PCBS.lock();
+    let pcb = pcb_get_mut(&mut pcbs, desc).ok_or(())?;
+    let route = ip::route_lookup(pcb.remote.addr).ok_or_else(|| {
+        crate::errorf!("iface not found");
+    })?;
+    let mtu = route.iface.dev().mtu as usize;
+    pcb.mss = (mtu - IP_HDR_SIZE_MIN - TCP_HDR_SIZE) as u16;
+    crate::debugf!("success, local={}, remote={}", pcb.local, pcb.remote);
+    Ok(())
 }
 
 pub fn init() -> Result<(), ()> {

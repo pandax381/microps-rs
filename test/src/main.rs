@@ -51,21 +51,34 @@ fn cleanup() -> Result<(), ()> {
 }
 
 fn app_main() -> Result<(), ()> {
-    let local: IpEndp = "0.0.0.0:0".parse()?;
-    let remote: IpEndp = "192.0.2.1:10007".parse()?;
-    let desc = tcp::open(local, remote, true)?;
+    let local: IpEndp = "0.0.0.0:7".parse()?;
+    let desc = tcp::socket()?;
+    if tcp::bind(desc, local).is_err() {
+        let _ = tcp::close(desc);
+        return Err(());
+    }
+    if tcp::listen(desc, 1).is_err() {
+        let _ = tcp::close(desc);
+        return Err(());
+    }
+    let (new_desc, remote) = match tcp::accept(desc) {
+        Ok(v) => v,
+        Err(()) => return Err(()),
+    };
+    debugf!("connection from {}, desc={}", remote, new_desc);
     debugf!("press Ctrl+C to terminate");
     let mut buf = [0u8; 128];
     while !TERMINATE.load(Ordering::Relaxed) {
-        let n = match tcp::receive(desc, &mut buf) {
+        let n = match tcp::receive(new_desc, &mut buf) {
             Ok(n) if n > 0 => n,
             _ => break,
         };
         infof!("{} bytes data received", n);
         printf!("{}", HexDump(&buf[..n]));
-        let _ = tcp::send(desc, &buf[..n]);
+        let _ = tcp::send(new_desc, &buf[..n]);
     }
-    tcp::close(desc)?;
+    let _ = tcp::close(new_desc);
+    let _ = tcp::close(desc);
     debugf!("terminate");
     Ok(())
 }
@@ -75,8 +88,8 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let ret = app_main();
-    // Wait long enough for the TIME_WAIT timer to fire before shutting down.
-    std::thread::sleep(std::time::Duration::from_secs(35));
+    // Give the FIN handshake a moment to complete before shutting down.
+    std::thread::sleep(std::time::Duration::from_secs(1));
     if cleanup().is_err() {
         return ExitCode::FAILURE;
     }
