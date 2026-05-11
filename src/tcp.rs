@@ -29,6 +29,8 @@ const RECV_BUF_SIZE: usize = 65535;
 const TCP_DEFAULT_RTO: Duration = Duration::from_micros(200_000);
 const TCP_RETRANS_DEADLINE: Duration = Duration::from_secs(12);
 const TCP_TIMER_INTERVAL: Duration = Duration::from_millis(100);
+const DYNAMIC_PORT_MIN: u16 = 49152;
+const DYNAMIC_PORT_MAX: u16 = 65535;
 
 pub type TcpDesc = usize;
 
@@ -547,7 +549,50 @@ fn segment_arrives(
             return;
         }
         TcpState::SynSent => {
-            // TODO: implemented in step 25 (active open)
+            // 1st check the ACK bit
+            let mut acceptable = false;
+            if flag_isset(flags, TCP_FLG_ACK) {
+                let pcb = pcbs[desc].as_ref().unwrap();
+                if seg.ack <= pcb.iss || seg.ack > pcb.snd.nxt {
+                    let _ = output_segment(
+                        seg.ack, 0, TCP_FLG_RST, 0, &[], local, remote,
+                    );
+                    return;
+                }
+                if pcb.snd.una <= seg.ack && seg.ack <= pcb.snd.nxt {
+                    acceptable = true;
+                }
+            }
+            // 2nd check the RST bit (TODO)
+            // 3rd check security and precedence (ignore)
+            // 4th check the SYN bit
+            if flag_isset(flags, TCP_FLG_SYN) {
+                let pcb = pcbs[desc].as_mut().unwrap();
+                pcb.rcv.nxt = seg.seq.wrapping_add(1);
+                pcb.irs = seg.seq;
+                if acceptable {
+                    pcb.snd.una = seg.ack;
+                    retrans_queue_cleanup(pcb);
+                }
+                if pcb.snd.una > pcb.iss {
+                    transition(pcb, desc, TcpState::Established);
+                    let _ = output(pcb, TCP_FLG_ACK, &[]);
+                    // RFC793 does not explicitly initialize the send window here,
+                    // but it is required so subsequent send() can compute capacity.
+                    pcb.snd.wnd = seg.wnd;
+                    pcb.snd.wl1 = seg.seq;
+                    pcb.snd.wl2 = seg.ack;
+                    let task = pcb.task.clone();
+                    task.notify();
+                    // ignore: continue processing at the sixth step below where
+                    // the URG bit is checked
+                    return;
+                } else {
+                    // TODO: simultaneous open
+                    return;
+                }
+            }
+            // 5th, if neither SYN nor RST is set, drop the segment
             return;
         }
         _ => {}
@@ -705,20 +750,76 @@ pub fn open(local: IpEndp, remote: IpEndp, active: bool) -> Result<TcpDesc, ()> 
             remote
         );
         if active {
-            crate::errorf!("active open does not implement");
-            let _ = pcb_release(&mut pcbs, desc);
-            return Err(());
+            let mut local = local;
+            // Auto-select local address if wildcard.
+            if local.addr == IpAddr::ANY {
+                let Some(route) = ip::route_lookup(remote.addr) else {
+                    crate::errorf!(
+                        "iface not found that can reach remote address, addr={}",
+                        remote.addr
+                    );
+                    let _ = pcb_release(&mut pcbs, desc);
+                    return Err(());
+                };
+                local.addr = route.iface.unicast();
+                crate::debugf!("select local address, addr={}", local.addr);
+            }
+            // Dynamically assign local port if 0.
+            if local.port == 0 {
+                let mut assigned = None;
+                for port in DYNAMIC_PORT_MIN..=DYNAMIC_PORT_MAX {
+                    let candidate = IpEndp::new(local.addr, port);
+                    if pcb_select(&pcbs, candidate, remote).is_none() {
+                        assigned = Some(port);
+                        break;
+                    }
+                }
+                match assigned {
+                    Some(port) => {
+                        local.port = port;
+                        crate::debugf!("dynamic assign local port, port={}", port);
+                    }
+                    None => {
+                        crate::errorf!(
+                            "failed to dynamic assign local port, addr={}",
+                            local.addr
+                        );
+                        let _ = pcb_release(&mut pcbs, desc);
+                        return Err(());
+                    }
+                }
+            }
+            if pcb_select(&pcbs, local, remote).is_some() {
+                crate::errorf!("address already in use");
+                let _ = pcb_release(&mut pcbs, desc);
+                return Err(());
+            }
+            let pcb = pcb_get_mut(&mut pcbs, desc).unwrap();
+            pcb.local = local;
+            pcb.remote = remote;
+            pcb.rcv.wnd = RECV_BUF_SIZE as u16;
+            pcb.iss = crate::platform::random32();
+            if output(pcb, TCP_FLG_SYN, &[]).is_err() {
+                crate::errorf!("tcp::output() failure");
+                transition(pcb, desc, TcpState::Closed);
+                let _ = pcb_release(&mut pcbs, desc);
+                return Err(());
+            }
+            pcb.snd.una = pcb.iss;
+            pcb.snd.nxt = pcb.iss.wrapping_add(1);
+            transition(pcb, desc, TcpState::SynSent);
+        } else {
+            if pcb_select(&pcbs, local, remote).is_some() {
+                crate::errorf!("address already in use");
+                let _ = pcb_release(&mut pcbs, desc);
+                return Err(());
+            }
+            let pcb = pcb_get_mut(&mut pcbs, desc).unwrap();
+            pcb.local = local;
+            pcb.remote = remote;
+            transition(pcb, desc, TcpState::Listen);
+            crate::debugf!("waiting for connection...");
         }
-        if pcb_select(&pcbs, local, remote).is_some() {
-            crate::errorf!("address already in use");
-            let _ = pcb_release(&mut pcbs, desc);
-            return Err(());
-        }
-        let pcb = pcb_get_mut(&mut pcbs, desc).unwrap();
-        pcb.local = local;
-        pcb.remote = remote;
-        transition(pcb, desc, TcpState::Listen);
-        crate::debugf!("waiting for connection...");
         desc
     };
 
@@ -729,7 +830,7 @@ pub fn open(local: IpEndp, remote: IpEndp, active: bool) -> Result<TcpDesc, ()> 
             let pcb = pcb_get_mut(&mut pcbs, desc).ok_or(())?;
             match pcb.state {
                 TcpState::Established => break,
-                TcpState::Listen | TcpState::SynReceived => {
+                TcpState::Listen | TcpState::SynReceived | TcpState::SynSent => {
                     (pcb.task.clone(), pcb.task.snapshot())
                 }
                 other => {

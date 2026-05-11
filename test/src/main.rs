@@ -51,9 +51,9 @@ fn cleanup() -> Result<(), ()> {
 }
 
 fn app_main() -> Result<(), ()> {
-    let local: IpEndp = "0.0.0.0:7".parse()?;
-    let remote: IpEndp = "0.0.0.0:0".parse()?;
-    let desc = tcp::open(local, remote, false)?;
+    let local: IpEndp = "0.0.0.0:0".parse()?;
+    let remote: IpEndp = "192.0.2.1:10007".parse()?;
+    let desc = tcp::open(local, remote, true)?;
     debugf!("press Ctrl+C to terminate");
     let mut buf = [0u8; 128];
     while !TERMINATE.load(Ordering::Relaxed) {
