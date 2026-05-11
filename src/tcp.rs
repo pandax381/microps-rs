@@ -1,9 +1,12 @@
 //! TCP protocol.
 
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use core::time::Duration;
 
 use spin::Mutex;
 
@@ -23,6 +26,9 @@ pub const TCP_FLG_URG: u8 = 0x20;
 
 pub const PCB_SIZE_MAX: usize = 16;
 const RECV_BUF_SIZE: usize = 65535;
+const TCP_DEFAULT_RTO: Duration = Duration::from_micros(200_000);
+const TCP_RETRANS_DEADLINE: Duration = Duration::from_secs(12);
+const TCP_TIMER_INTERVAL: Duration = Duration::from_millis(100);
 
 pub type TcpDesc = usize;
 
@@ -240,6 +246,15 @@ struct SegInfo {
     up: u16,
 }
 
+struct TcpQueueEntry {
+    first: Duration,
+    last: Duration,
+    rto: Duration,
+    seq: u32,
+    flg: u8,
+    data: Vec<u8>,
+}
+
 #[allow(dead_code)]
 struct TcpPcb {
     state: TcpState,
@@ -251,6 +266,7 @@ struct TcpPcb {
     irs: u32,
     mss: u16,
     buf: Vec<u8>,
+    queue: VecDeque<TcpQueueEntry>,
     task: Arc<Task>,
 }
 
@@ -266,6 +282,7 @@ impl TcpPcb {
             irs: 0,
             mss: 0,
             buf: Vec::new(),
+            queue: VecDeque::new(),
             task: task::new_task(),
         }
     }
@@ -308,14 +325,87 @@ fn transition(pcb: &mut TcpPcb, desc: TcpDesc, new_state: TcpState) {
     pcb.state = new_state;
 }
 
-fn output(pcb: &TcpPcb, flg: u8, data: &[u8]) -> Result<usize, ()> {
+fn output(pcb: &mut TcpPcb, flg: u8, data: &[u8]) -> Result<usize, ()> {
     let seq = if flag_isset(flg, TCP_FLG_SYN) {
         pcb.iss
     } else {
         pcb.snd.nxt
     };
-    // TODO: add to retransmission queue for SYN/FIN/data
+    if flag_isset(flg, TCP_FLG_SYN | TCP_FLG_FIN) || !data.is_empty() {
+        retrans_queue_add(pcb, seq, flg, data);
+    }
     output_segment(seq, pcb.rcv.nxt, flg, pcb.rcv.wnd, data, pcb.local, pcb.remote)
+}
+
+fn retrans_queue_add(pcb: &mut TcpPcb, seq: u32, flg: u8, data: &[u8]) {
+    let now = crate::time::now();
+    pcb.queue.push_back(TcpQueueEntry {
+        first: now,
+        last: now,
+        rto: TCP_DEFAULT_RTO,
+        seq,
+        flg,
+        data: data.to_vec(),
+    });
+    crate::debugf!("num={}, seq={}", pcb.queue.len(), seq);
+}
+
+fn retrans_queue_cleanup(pcb: &mut TcpPcb) {
+    while let Some(entry) = pcb.queue.front() {
+        let mut consume = entry.data.len() as u32;
+        if flag_isset(entry.flg, TCP_FLG_SYN | TCP_FLG_FIN) {
+            consume += 1;
+        }
+        if pcb.snd.una < entry.seq.wrapping_add(consume) {
+            break;
+        }
+        let popped = pcb.queue.pop_front().unwrap();
+        crate::debugf!("num={}, seq={}", pcb.queue.len(), popped.seq);
+    }
+}
+
+fn retrans_emit(pcbs: &mut [Option<TcpPcb>], desc: usize) {
+    let now = crate::time::now();
+
+    let deadline_exceeded = {
+        let Some(pcb) = pcbs[desc].as_ref() else { return };
+        pcb.queue
+            .iter()
+            .any(|e| now >= e.first + TCP_RETRANS_DEADLINE)
+    };
+    if deadline_exceeded {
+        let pcb = pcbs[desc].as_mut().unwrap();
+        let task = pcb.task.clone();
+        transition(pcb, desc, TcpState::Closed);
+        task.notify();
+        return;
+    }
+
+    let pcb = pcbs[desc].as_mut().unwrap();
+    let local = pcb.local;
+    let remote = pcb.remote;
+    let rcv_nxt = pcb.rcv.nxt;
+    let rcv_wnd = pcb.rcv.wnd;
+    for entry in pcb.queue.iter_mut() {
+        if now >= entry.last + entry.rto {
+            crate::debugf!("desc={}, seq={}", desc, entry.seq);
+            let _ = output_segment(
+                entry.seq, rcv_nxt, entry.flg, rcv_wnd, &entry.data, local, remote,
+            );
+            entry.last = now;
+            entry.rto *= 2;
+        }
+    }
+}
+
+fn on_timer() {
+    let mut pcbs = PCBS.lock();
+    let len = pcbs.len();
+    for desc in 0..len {
+        if pcbs[desc].is_some() {
+            retrans_emit(&mut pcbs, desc);
+        }
+    }
 }
 
 fn pcb_select(pcbs: &[Option<TcpPcb>], local: IpEndp, remote: IpEndp) -> Option<usize> {
@@ -485,7 +575,7 @@ fn segment_arrives(
     };
     if !acceptable {
         if !flag_isset(flags, TCP_FLG_RST) {
-            let pcb = pcbs[desc].as_ref().unwrap();
+            let pcb = pcbs[desc].as_mut().unwrap();
             let _ = output(pcb, TCP_FLG_ACK, &[]);
         }
         return;
@@ -513,7 +603,7 @@ fn segment_arrives(
     if pcb.state == TcpState::Established {
         if pcb.snd.una < seg.ack && seg.ack <= pcb.snd.nxt {
             pcb.snd.una = seg.ack;
-            // TODO: remove acknowledged segments from the retransmission queue
+            retrans_queue_cleanup(pcb);
             // Update send window if this ACK conveys newer information.
             if pcb.snd.wl1 < seg.seq
                 || (pcb.snd.wl1 == seg.seq && pcb.snd.wl2 <= seg.ack)
@@ -768,5 +858,6 @@ pub fn receive(desc: TcpDesc, buf: &mut [u8]) -> Result<usize, ()> {
 
 pub fn init() -> Result<(), ()> {
     ip::register_protocol(IP_PROTOCOL_TCP, input)?;
+    crate::platform::timer::register(TCP_TIMER_INTERVAL, Box::new(on_timer))?;
     Ok(())
 }
