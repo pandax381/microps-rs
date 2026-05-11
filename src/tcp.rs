@@ -250,6 +250,7 @@ struct TcpPcb {
     rcv: RcvVars,
     irs: u32,
     mss: u16,
+    buf: Vec<u8>,
     task: Arc<Task>,
 }
 
@@ -264,6 +265,7 @@ impl TcpPcb {
             rcv: RcvVars::default(),
             irs: 0,
             mss: 0,
+            buf: Vec::new(),
             task: task::new_task(),
         }
     }
@@ -383,7 +385,7 @@ fn segment_arrives(
     pcbs: &mut Vec<Option<TcpPcb>>,
     seg: &SegInfo,
     flags: u8,
-    _data: &[u8],
+    data: &[u8],
     local: IpEndp,
     remote: IpEndp,
 ) {
@@ -463,6 +465,35 @@ fn segment_arrives(
 
     // Otherwise (states other than CLOSED / LISTEN / SYN_SENT)
 
+    // 1st check sequence number
+    let acceptable = {
+        let pcb = pcbs[desc].as_ref().unwrap();
+        let nxt_plus_wnd = pcb.rcv.nxt.wrapping_add(pcb.rcv.wnd as u32);
+        if seg.len == 0 {
+            if pcb.rcv.wnd == 0 {
+                seg.seq == pcb.rcv.nxt
+            } else {
+                pcb.rcv.nxt <= seg.seq && seg.seq < nxt_plus_wnd
+            }
+        } else if pcb.rcv.wnd == 0 {
+            false
+        } else {
+            let end_seq = seg.seq.wrapping_add(seg.len).wrapping_sub(1);
+            (pcb.rcv.nxt <= seg.seq && seg.seq < nxt_plus_wnd)
+                || (pcb.rcv.nxt <= end_seq && end_seq < nxt_plus_wnd)
+        }
+    };
+    if !acceptable {
+        if !flag_isset(flags, TCP_FLG_RST) {
+            let pcb = pcbs[desc].as_ref().unwrap();
+            let _ = output(pcb, TCP_FLG_ACK, &[]);
+        }
+        return;
+    }
+    // 2nd check the RST bit (TODO)
+    // 3rd check security and precedence (ignore)
+    // 4th check the SYN bit (TODO)
+
     // 5th check the ACK field
     if !flag_isset(flags, TCP_FLG_ACK) {
         return;
@@ -473,11 +504,49 @@ fn segment_arrives(
             transition(pcb, desc, TcpState::Established);
             let task = pcb.task.clone();
             task.notify();
+            // fall through to ESTABLISHED
         } else {
             let _ = output_segment(seg.ack, 0, TCP_FLG_RST, 0, &[], local, remote);
+            return;
         }
     }
-    // TODO: other states in later steps
+    if pcb.state == TcpState::Established {
+        if pcb.snd.una < seg.ack && seg.ack <= pcb.snd.nxt {
+            pcb.snd.una = seg.ack;
+            // TODO: remove acknowledged segments from the retransmission queue
+            // Update send window if this ACK conveys newer information.
+            if pcb.snd.wl1 < seg.seq
+                || (pcb.snd.wl1 == seg.seq && pcb.snd.wl2 <= seg.ack)
+            {
+                pcb.snd.wnd = seg.wnd;
+                pcb.snd.wl1 = seg.seq;
+                pcb.snd.wl2 = seg.ack;
+            }
+        } else if seg.ack < pcb.snd.una {
+            // duplicate ACK: ignore
+        } else if pcb.snd.nxt < seg.ack {
+            let _ = output(pcb, TCP_FLG_ACK, &[]);
+            return;
+        }
+    }
+    // 6th URG bit (ignore)
+    // 7th process segment text (ESTABLISHED)
+    if pcb.state == TcpState::Established && !data.is_empty() {
+        let len = data.len();
+        if pcb.rcv.nxt != seg.seq || (pcb.rcv.wnd as usize) < len {
+            // Out of order or larger than window: re-ack to request the optimal segment.
+            let _ = output(pcb, TCP_FLG_ACK, &[]);
+            return;
+        }
+        crate::debugf!("copy segment text, len={}, wnd={}", len, pcb.rcv.wnd);
+        pcb.buf.extend_from_slice(data);
+        pcb.rcv.nxt = seg.seq.wrapping_add(len as u32);
+        pcb.rcv.wnd -= len as u16;
+        let _ = output(pcb, TCP_FLG_ACK, &[]);
+        let task = pcb.task.clone();
+        task.notify();
+    }
+    // 8th FIN bit (TODO)
 }
 
 fn input(hdr: &IpHdr<'_>, data: &[u8], iface: &IpIface) {
@@ -619,6 +688,82 @@ pub fn close(desc: TcpDesc) -> Result<(), ()> {
     }
     pcb_release(&mut pcbs, desc)?;
     Ok(())
+}
+
+pub fn send(desc: TcpDesc, data: &[u8]) -> Result<usize, ()> {
+    let mut sent: usize = 0;
+    loop {
+        let wait = {
+            let mut pcbs = PCBS.lock();
+            let pcb = pcb_get_mut(&mut pcbs, desc).ok_or_else(|| {
+                crate::errorf!("pcb not found, desc={}", desc);
+            })?;
+            if pcb.state != TcpState::Established {
+                crate::errorf!("invalid state '{}'", pcb.state);
+                return Err(());
+            }
+            if sent >= data.len() {
+                return Ok(sent);
+            }
+            let in_flight = pcb.snd.nxt.wrapping_sub(pcb.snd.una);
+            let cap = (pcb.snd.wnd as u32).saturating_sub(in_flight);
+            if cap == 0 {
+                Some((pcb.task.clone(), pcb.task.snapshot()))
+            } else {
+                let remain = data.len() - sent;
+                let slen = (pcb.mss as usize).min(remain).min(cap as usize);
+                let _ = output(pcb, TCP_FLG_ACK | TCP_FLG_PSH, &data[sent..sent + slen]);
+                pcb.snd.nxt = pcb.snd.nxt.wrapping_add(slen as u32);
+                sent += slen;
+                None
+            }
+        };
+        if let Some((task, snapshot)) = wait {
+            match task.wait_after(snapshot) {
+                WaitResult::Notified => continue,
+                WaitResult::Interrupted => {
+                    crate::debugf!("interrupted");
+                    if sent == 0 {
+                        return Err(());
+                    }
+                    return Ok(sent);
+                }
+            }
+        }
+    }
+}
+
+pub fn receive(desc: TcpDesc, buf: &mut [u8]) -> Result<usize, ()> {
+    loop {
+        let wait = {
+            let mut pcbs = PCBS.lock();
+            let pcb = pcb_get_mut(&mut pcbs, desc).ok_or_else(|| {
+                crate::errorf!("pcb not found, desc={}", desc);
+            })?;
+            if pcb.state != TcpState::Established {
+                crate::errorf!("unknown state '{}'", pcb.state);
+                return Err(());
+            }
+            if pcb.buf.is_empty() {
+                Some((pcb.task.clone(), pcb.task.snapshot()))
+            } else {
+                let n = buf.len().min(pcb.buf.len());
+                buf[..n].copy_from_slice(&pcb.buf[..n]);
+                pcb.buf.drain(..n);
+                pcb.rcv.wnd += n as u16;
+                return Ok(n);
+            }
+        };
+        if let Some((task, snapshot)) = wait {
+            match task.wait_after(snapshot) {
+                WaitResult::Notified => continue,
+                WaitResult::Interrupted => {
+                    crate::debugf!("interrupted");
+                    return Err(());
+                }
+            }
+        }
+    }
 }
 
 pub fn init() -> Result<(), ()> {

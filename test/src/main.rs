@@ -1,14 +1,13 @@
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::Duration;
 
 use microps::driver::loopback;
 use microps::ether::EtherAddr;
 use microps::ip::{self, IpAddr, IpEndp};
 use microps::platform::driver::ether_tap;
 use microps::platform::intr;
-use microps::{debugf, net, tcp};
+use microps::util::HexDump;
+use microps::{debugf, infof, net, printf, tcp};
 
 mod defs;
 
@@ -56,8 +55,15 @@ fn app_main() -> Result<(), ()> {
     let remote: IpEndp = "0.0.0.0:0".parse()?;
     let desc = tcp::open(local, remote, false)?;
     debugf!("press Ctrl+C to terminate");
+    let mut buf = [0u8; 128];
     while !TERMINATE.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_secs(1));
+        let n = match tcp::receive(desc, &mut buf) {
+            Ok(n) if n > 0 => n,
+            _ => break,
+        };
+        infof!("{} bytes data received", n);
+        printf!("{}", HexDump(&buf[..n]));
+        let _ = tcp::send(desc, &buf[..n]);
     }
     tcp::close(desc)?;
     debugf!("terminate");
