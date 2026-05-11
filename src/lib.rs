@@ -14,6 +14,7 @@ pub mod ip;
 pub mod log;
 pub mod net;
 pub mod platform;
+pub mod tcp;
 pub mod time;
 pub mod udp;
 pub mod util;

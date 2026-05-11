@@ -1,16 +1,14 @@
-use std::io::Read;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use microps::driver::loopback;
 use microps::ether::EtherAddr;
-use microps::ip::{self, IpAddr, IpEndp};
+use microps::ip::{self, IpAddr};
 use microps::platform::driver::ether_tap;
 use microps::platform::intr;
-use microps::udp::{self, RecvError, UdpDesc};
-use microps::util::HexDump;
-use microps::{debugf, errorf, infof, net, printf, warnf};
+use microps::{debugf, net};
 
 mod defs;
 
@@ -53,47 +51,11 @@ fn cleanup() -> Result<(), ()> {
     Ok(())
 }
 
-fn receiver(desc: UdpDesc) {
-    debugf!("running...");
-    let mut buf = [0u8; 128];
-    while !TERMINATE.load(Ordering::Relaxed) {
-        match udp::recvfrom(desc, &mut buf) {
-            Ok((remote, n)) => {
-                infof!("{} bytes data receive from {}", n, remote);
-                printf!("{}", HexDump(&buf[..n]));
-            }
-            Err(RecvError::Interrupted) => continue,
-            Err(RecvError::NotBound) => {
-                warnf!("udp::recvfrom() failure");
-                break;
-            }
-        }
-    }
-    debugf!("terminate");
-}
-
 fn app_main() -> Result<(), ()> {
-    let desc = udp::open().ok_or(())?;
-    let remote: IpEndp = "192.0.2.1:10007".parse()?;
-
-    let handle = thread::spawn(move || receiver(desc));
-
     debugf!("press Ctrl+C to terminate");
-    let mut stdin = std::io::stdin();
-    let mut buf = [0u8; 128];
     while !TERMINATE.load(Ordering::Relaxed) {
-        let Ok(n) = stdin.read(&mut buf) else { break; };
-        if n == 0 { break; }
-        infof!("{} bytes data send to {}", n, remote);
-        printf!("{}", HexDump(&buf[..n]));
-        if udp::sendto(desc, &buf[..n], remote).is_err() {
-            errorf!("udp::sendto() failure");
-            break;
-        }
+        thread::sleep(Duration::from_secs(1));
     }
-
-    udp::close(desc)?;
-    let _ = handle.join();
     debugf!("terminate");
     Ok(())
 }

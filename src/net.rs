@@ -46,6 +46,7 @@ pub fn init() -> Result<(), ()> {
     crate::ip::init()?;
     crate::icmp::init()?;
     crate::udp::init()?;
+    crate::tcp::init()?;
     crate::infof!("success");
     Ok(())
 }
