@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use microps::driver::loopback;
 use microps::ether::EtherAddr;
-use microps::ip::{self, IpAddr};
+use microps::ip::{self, IpAddr, IpEndp};
 use microps::platform::driver::ether_tap;
 use microps::platform::intr;
-use microps::{debugf, net};
+use microps::{debugf, net, tcp};
 
 mod defs;
 
@@ -52,10 +52,14 @@ fn cleanup() -> Result<(), ()> {
 }
 
 fn app_main() -> Result<(), ()> {
+    let local: IpEndp = "0.0.0.0:7".parse()?;
+    let remote: IpEndp = "0.0.0.0:0".parse()?;
+    let desc = tcp::open(local, remote, false)?;
     debugf!("press Ctrl+C to terminate");
     while !TERMINATE.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
     }
+    tcp::close(desc)?;
     debugf!("terminate");
     Ok(())
 }

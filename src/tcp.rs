@@ -7,8 +7,8 @@ use core::fmt;
 
 use spin::Mutex;
 
-use crate::ip::{self, IpAddr, IpEndp, IpHdr, IpIface, IP_PROTOCOL_TCP};
-use crate::platform::task::{self, Task};
+use crate::ip::{self, IpAddr, IpEndp, IpHdr, IpIface, IP_HDR_SIZE_MIN, IP_PROTOCOL_TCP};
+use crate::platform::task::{self, Task, WaitResult};
 use crate::util;
 
 pub const TCP_HDR_SIZE: usize = 20;
@@ -22,6 +22,9 @@ pub const TCP_FLG_ACK: u8 = 0x10;
 pub const TCP_FLG_URG: u8 = 0x20;
 
 pub const PCB_SIZE_MAX: usize = 16;
+const RECV_BUF_SIZE: usize = 65535;
+
+pub type TcpDesc = usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpState {
@@ -268,7 +271,6 @@ impl TcpPcb {
 
 static PCBS: Mutex<Vec<Option<TcpPcb>>> = Mutex::new(Vec::new());
 
-#[allow(dead_code)]
 fn pcb_alloc(pcbs: &mut Vec<Option<TcpPcb>>) -> Option<usize> {
     for (i, slot) in pcbs.iter_mut().enumerate() {
         if slot.is_none() {
@@ -284,7 +286,6 @@ fn pcb_alloc(pcbs: &mut Vec<Option<TcpPcb>>) -> Option<usize> {
     Some(desc)
 }
 
-#[allow(dead_code)]
 fn pcb_release(pcbs: &mut [Option<TcpPcb>], desc: usize) -> Result<(), ()> {
     let pcb = pcbs.get_mut(desc).and_then(|s| s.as_mut()).ok_or(())?;
     let task = pcb.task.clone();
@@ -293,12 +294,26 @@ fn pcb_release(pcbs: &mut [Option<TcpPcb>], desc: usize) -> Result<(), ()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 fn pcb_get_mut<'a>(
     pcbs: &'a mut [Option<TcpPcb>],
     desc: usize,
 ) -> Option<&'a mut TcpPcb> {
     pcbs.get_mut(desc).and_then(|s| s.as_mut())
+}
+
+fn transition(pcb: &mut TcpPcb, desc: TcpDesc, new_state: TcpState) {
+    crate::debugf!("desc={}, {} => {}", desc, pcb.state, new_state);
+    pcb.state = new_state;
+}
+
+fn output(pcb: &TcpPcb, flg: u8, data: &[u8]) -> Result<usize, ()> {
+    let seq = if flag_isset(flg, TCP_FLG_SYN) {
+        pcb.iss
+    } else {
+        pcb.snd.nxt
+    };
+    // TODO: add to retransmission queue for SYN/FIN/data
+    output_segment(seq, pcb.rcv.nxt, flg, pcb.rcv.wnd, data, pcb.local, pcb.remote)
 }
 
 fn pcb_select(pcbs: &[Option<TcpPcb>], local: IpEndp, remote: IpEndp) -> Option<usize> {
@@ -373,6 +388,8 @@ fn segment_arrives(
     remote: IpEndp,
 ) {
     let pcb_desc = pcb_select(pcbs, local, remote);
+
+    // CLOSED state (or no PCB)
     let is_closed = match pcb_desc {
         Some(desc) => pcbs[desc].as_ref().unwrap().state == TcpState::Closed,
         None => true,
@@ -400,7 +417,67 @@ fn segment_arrives(
         }
         return;
     }
-    // TODO: implemented in the next step
+
+    let desc = pcb_desc.unwrap();
+    let state = pcbs[desc].as_ref().unwrap().state;
+    crate::debugf!("desc={}, state={}", desc, state);
+
+    match state {
+        TcpState::Listen => {
+            // 1st check for an RST
+            if flag_isset(flags, TCP_FLG_RST) {
+                return;
+            }
+            // 2nd check for an ACK
+            if flag_isset(flags, TCP_FLG_ACK) {
+                let _ = output_segment(seg.ack, 0, TCP_FLG_RST, 0, &[], local, remote);
+                return;
+            }
+            // 3rd check for an SYN
+            if flag_isset(flags, TCP_FLG_SYN) {
+                // ignore: security/compartment check
+                let pcb = pcbs[desc].as_mut().unwrap();
+                pcb.local = local;
+                pcb.remote = remote;
+                pcb.rcv.wnd = RECV_BUF_SIZE as u16;
+                pcb.rcv.nxt = seg.seq.wrapping_add(1);
+                pcb.irs = seg.seq;
+                pcb.iss = crate::platform::random32();
+                let _ = output(pcb, TCP_FLG_SYN | TCP_FLG_ACK, &[]);
+                pcb.snd.nxt = pcb.iss.wrapping_add(1);
+                pcb.snd.una = pcb.iss;
+                transition(pcb, desc, TcpState::SynReceived);
+                // ignore: Note that any other incoming control or data
+                // (combined with SYN) will be processed in the SYN-RECEIVED state,
+                // but processing of SYN and ACK should not be repeated
+            }
+            // 4th other text or control: drop segment
+            return;
+        }
+        TcpState::SynSent => {
+            // TODO: implemented in step 25 (active open)
+            return;
+        }
+        _ => {}
+    }
+
+    // Otherwise (states other than CLOSED / LISTEN / SYN_SENT)
+
+    // 5th check the ACK field
+    if !flag_isset(flags, TCP_FLG_ACK) {
+        return;
+    }
+    let pcb = pcbs[desc].as_mut().unwrap();
+    if pcb.state == TcpState::SynReceived {
+        if pcb.snd.una <= seg.ack && seg.ack <= pcb.snd.nxt {
+            transition(pcb, desc, TcpState::Established);
+            let task = pcb.task.clone();
+            task.notify();
+        } else {
+            let _ = output_segment(seg.ack, 0, TCP_FLG_RST, 0, &[], local, remote);
+        }
+    }
+    // TODO: other states in later steps
 }
 
 fn input(hdr: &IpHdr<'_>, data: &[u8], iface: &IpIface) {
@@ -454,6 +531,94 @@ fn input(hdr: &IpHdr<'_>, data: &[u8], iface: &IpIface) {
     };
     let mut pcbs = PCBS.lock();
     segment_arrives(&mut pcbs, &seg, tcp.flg(), &data[hlen..], dst, src);
+}
+
+pub fn open(local: IpEndp, remote: IpEndp, active: bool) -> Result<TcpDesc, ()> {
+    let desc = {
+        let mut pcbs = PCBS.lock();
+        let desc = pcb_alloc(&mut pcbs).ok_or_else(|| {
+            crate::errorf!("pcb_alloc() failure");
+        })?;
+        crate::debugf!(
+            "mode={}, local={}, remote={}",
+            if active { "active" } else { "passive" },
+            local,
+            remote
+        );
+        if active {
+            crate::errorf!("active open does not implement");
+            let _ = pcb_release(&mut pcbs, desc);
+            return Err(());
+        }
+        if pcb_select(&pcbs, local, remote).is_some() {
+            crate::errorf!("address already in use");
+            let _ = pcb_release(&mut pcbs, desc);
+            return Err(());
+        }
+        let pcb = pcb_get_mut(&mut pcbs, desc).unwrap();
+        pcb.local = local;
+        pcb.remote = remote;
+        transition(pcb, desc, TcpState::Listen);
+        crate::debugf!("waiting for connection...");
+        desc
+    };
+
+    // Wait for state to become ESTABLISHED (or fail).
+    loop {
+        let (task, snapshot) = {
+            let mut pcbs = PCBS.lock();
+            let pcb = pcb_get_mut(&mut pcbs, desc).ok_or(())?;
+            match pcb.state {
+                TcpState::Established => break,
+                TcpState::Listen | TcpState::SynReceived => {
+                    (pcb.task.clone(), pcb.task.snapshot())
+                }
+                other => {
+                    crate::errorf!("open error: state={}", other);
+                    transition(pcb, desc, TcpState::Closed);
+                    let _ = pcb_release(&mut pcbs, desc);
+                    return Err(());
+                }
+            }
+        };
+        match task.wait_after(snapshot) {
+            WaitResult::Notified => continue,
+            WaitResult::Interrupted => {
+                crate::debugf!("interrupted");
+                let mut pcbs = PCBS.lock();
+                if let Some(pcb) = pcb_get_mut(&mut pcbs, desc) {
+                    transition(pcb, desc, TcpState::Closed);
+                }
+                let _ = pcb_release(&mut pcbs, desc);
+                return Err(());
+            }
+        }
+    }
+
+    // ESTABLISHED. Compute MSS from the outgoing interface MTU.
+    let mut pcbs = PCBS.lock();
+    let pcb = pcb_get_mut(&mut pcbs, desc).ok_or(())?;
+    let route = ip::route_lookup(pcb.remote.addr).ok_or_else(|| {
+        crate::errorf!("iface not found");
+    })?;
+    let mtu = route.iface.dev().mtu as usize;
+    pcb.mss = (mtu - IP_HDR_SIZE_MIN - TCP_HDR_SIZE) as u16;
+    crate::debugf!("success, local={}, remote={}", pcb.local, pcb.remote);
+    Ok(desc)
+}
+
+pub fn close(desc: TcpDesc) -> Result<(), ()> {
+    let mut pcbs = PCBS.lock();
+    {
+        let pcb = pcb_get_mut(&mut pcbs, desc).ok_or_else(|| {
+            crate::errorf!("pcb not found, desc={}", desc);
+        })?;
+        crate::debugf!("desc={}", desc);
+        let _ = output(pcb, TCP_FLG_RST, &[]);
+        transition(pcb, desc, TcpState::Closed);
+    }
+    pcb_release(&mut pcbs, desc)?;
+    Ok(())
 }
 
 pub fn init() -> Result<(), ()> {
