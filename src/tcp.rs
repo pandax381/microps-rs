@@ -584,7 +584,16 @@ fn segment_arrives(
                     acceptable = true;
                 }
             }
-            // 2nd check the RST bit (TODO)
+            // 2nd check the RST bit
+            if flag_isset(flags, TCP_FLG_RST) {
+                if acceptable {
+                    crate::errorf!("connection reset");
+                    let pcb = pcbs[desc].as_mut().unwrap();
+                    transition(pcb, desc, TcpState::Closed);
+                    let _ = pcb_release(pcbs, desc);
+                }
+                return;
+            }
             // 3rd check security and precedence (ignore)
             // 4th check the SYN bit
             if flag_isset(flags, TCP_FLG_SYN) {
@@ -609,7 +618,11 @@ fn segment_arrives(
                     // the URG bit is checked
                     return;
                 } else {
-                    // TODO: simultaneous open
+                    // simultaneous open
+                    transition(pcb, desc, TcpState::SynReceived);
+                    let _ = output(pcb, TCP_FLG_SYN | TCP_FLG_ACK, &[]);
+                    // ignore: If there are other controls or text in the segment,
+                    // queue them for processing after the ESTABLISHED state.
                     return;
                 }
             }
@@ -646,9 +659,41 @@ fn segment_arrives(
         }
         return;
     }
-    // 2nd check the RST bit (TODO)
+    // 2nd check the RST bit
+    if flag_isset(flags, TCP_FLG_RST) {
+        let state = pcbs[desc].as_ref().unwrap().state;
+        match state {
+            TcpState::SynReceived
+            | TcpState::Closing
+            | TcpState::LastAck
+            | TcpState::TimeWait => {
+                let pcb = pcbs[desc].as_mut().unwrap();
+                transition(pcb, desc, TcpState::Closed);
+                let _ = pcb_release(pcbs, desc);
+            }
+            TcpState::Established
+            | TcpState::FinWait1
+            | TcpState::FinWait2
+            | TcpState::CloseWait => {
+                crate::errorf!("connection reset");
+                let pcb = pcbs[desc].as_mut().unwrap();
+                transition(pcb, desc, TcpState::Closed);
+                let _ = pcb_release(pcbs, desc);
+            }
+            _ => {}
+        }
+        return;
+    }
     // 3rd check security and precedence (ignore)
-    // 4th check the SYN bit (TODO)
+    // 4th check the SYN bit
+    if flag_isset(flags, TCP_FLG_SYN) {
+        let pcb = pcbs[desc].as_mut().unwrap();
+        let _ = output(pcb, TCP_FLG_RST, &[]);
+        crate::errorf!("connection reset");
+        transition(pcb, desc, TcpState::Closed);
+        let _ = pcb_release(pcbs, desc);
+        return;
+    }
 
     // 5th check the ACK field
     if !flag_isset(flags, TCP_FLG_ACK) {
@@ -695,6 +740,13 @@ fn segment_arrives(
             transition(pcb, desc, TcpState::FinWait2);
         }
         // FinWait2 / CloseWait: nothing extra
+    } else if pcb.state == TcpState::Closing {
+        if seg.ack == pcb.snd.nxt {
+            transition(pcb, desc, TcpState::TimeWait);
+            set_timewait_timer(pcb);
+            let task = pcb.task.clone();
+            task.notify();
+        }
     } else if pcb.state == TcpState::LastAck {
         if seg.ack == pcb.snd.nxt {
             transition(pcb, desc, TcpState::Closed);
@@ -744,13 +796,19 @@ fn segment_arrives(
                 task.notify();
             }
             TcpState::FinWait1 => {
-                // TODO: simultaneous close (step 28)
+                // simultaneous close
+                if seg.ack == pcb.snd.nxt {
+                    transition(pcb, desc, TcpState::TimeWait);
+                    set_timewait_timer(pcb);
+                } else {
+                    transition(pcb, desc, TcpState::Closing);
+                }
             }
             TcpState::FinWait2 => {
                 transition(pcb, desc, TcpState::TimeWait);
                 set_timewait_timer(pcb);
             }
-            // CLOSE_WAIT / LAST_ACK / TIME_WAIT: remain in current state
+            // CLOSING / CLOSE_WAIT / LAST_ACK / TIME_WAIT: remain in current state
             _ => {}
         }
     }
@@ -967,13 +1025,10 @@ pub fn close(desc: TcpDesc) -> Result<(), ()> {
         }
         TcpState::FinWait1
         | TcpState::FinWait2
+        | TcpState::Closing
         | TcpState::LastAck
         | TcpState::TimeWait => {
             crate::errorf!("connection closing");
-            return Err(());
-        }
-        other => {
-            crate::errorf!("unknown state '{}'", other);
             return Err(());
         }
     }
@@ -998,6 +1053,7 @@ pub fn send(desc: TcpDesc, data: &[u8]) -> Result<usize, ()> {
                 TcpState::Established | TcpState::CloseWait => {}
                 TcpState::FinWait1
                 | TcpState::FinWait2
+                | TcpState::Closing
                 | TcpState::LastAck
                 | TcpState::TimeWait => {
                     crate::errorf!("connection closing");
@@ -1069,7 +1125,7 @@ pub fn receive(desc: TcpDesc, buf: &mut [u8]) -> Result<usize, ()> {
                     pcb.rcv.wnd += n as u16;
                     return Ok(n);
                 }
-                TcpState::LastAck | TcpState::TimeWait => {
+                TcpState::Closing | TcpState::LastAck | TcpState::TimeWait => {
                     crate::debugf!("connection closing");
                     return Ok(0);
                 }
