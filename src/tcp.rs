@@ -1,6 +1,14 @@
 //! TCP protocol.
 
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::fmt;
+
+use spin::Mutex;
+
 use crate::ip::{self, IpAddr, IpEndp, IpHdr, IpIface, IP_PROTOCOL_TCP};
+use crate::platform::task::{self, Task};
 use crate::util;
 
 pub const TCP_HDR_SIZE: usize = 20;
@@ -12,6 +20,41 @@ pub const TCP_FLG_RST: u8 = 0x04;
 pub const TCP_FLG_PSH: u8 = 0x08;
 pub const TCP_FLG_ACK: u8 = 0x10;
 pub const TCP_FLG_URG: u8 = 0x20;
+
+pub const PCB_SIZE_MAX: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpState {
+    Closed,
+    Listen,
+    SynSent,
+    SynReceived,
+    Established,
+    FinWait1,
+    FinWait2,
+    CloseWait,
+    Closing,
+    LastAck,
+    TimeWait,
+}
+
+impl fmt::Display for TcpState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            TcpState::Closed => "CLOSED",
+            TcpState::Listen => "LISTEN",
+            TcpState::SynSent => "SYN_SENT",
+            TcpState::SynReceived => "SYN_RECEIVED",
+            TcpState::Established => "ESTABLISHED",
+            TcpState::FinWait1 => "FIN_WAIT1",
+            TcpState::FinWait2 => "FIN_WAIT2",
+            TcpState::CloseWait => "CLOSE_WAIT",
+            TcpState::Closing => "CLOSING",
+            TcpState::LastAck => "LAST_ACK",
+            TcpState::TimeWait => "TIME_WAIT",
+        })
+    }
+}
 
 fn flag_isset(flg: u8, mask: u8) -> bool {
     (flg & 0x3f) & mask != 0
@@ -166,6 +209,200 @@ fn print(data: &[u8]) {
     crate::printf!("{}", util::HexDump(data));
 }
 
+#[allow(dead_code)]
+#[derive(Default)]
+struct SndVars {
+    nxt: u32,
+    una: u32,
+    wnd: u16,
+    up: u16,
+    wl1: u32,
+    wl2: u32,
+}
+
+#[allow(dead_code)]
+#[derive(Default)]
+struct RcvVars {
+    nxt: u32,
+    wnd: u16,
+    up: u16,
+}
+
+#[allow(dead_code)]
+struct SegInfo {
+    seq: u32,
+    ack: u32,
+    len: u32,
+    wnd: u16,
+    up: u16,
+}
+
+#[allow(dead_code)]
+struct TcpPcb {
+    state: TcpState,
+    local: IpEndp,
+    remote: IpEndp,
+    snd: SndVars,
+    iss: u32,
+    rcv: RcvVars,
+    irs: u32,
+    mss: u16,
+    task: Arc<Task>,
+}
+
+impl TcpPcb {
+    fn empty() -> Self {
+        Self {
+            state: TcpState::Closed,
+            local: IpEndp::new(IpAddr::ANY, 0),
+            remote: IpEndp::new(IpAddr::ANY, 0),
+            snd: SndVars::default(),
+            iss: 0,
+            rcv: RcvVars::default(),
+            irs: 0,
+            mss: 0,
+            task: task::new_task(),
+        }
+    }
+}
+
+static PCBS: Mutex<Vec<Option<TcpPcb>>> = Mutex::new(Vec::new());
+
+#[allow(dead_code)]
+fn pcb_alloc(pcbs: &mut Vec<Option<TcpPcb>>) -> Option<usize> {
+    for (i, slot) in pcbs.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(TcpPcb::empty());
+            return Some(i);
+        }
+    }
+    if pcbs.len() >= PCB_SIZE_MAX {
+        return None;
+    }
+    let desc = pcbs.len();
+    pcbs.push(Some(TcpPcb::empty()));
+    Some(desc)
+}
+
+#[allow(dead_code)]
+fn pcb_release(pcbs: &mut [Option<TcpPcb>], desc: usize) -> Result<(), ()> {
+    let pcb = pcbs.get_mut(desc).and_then(|s| s.as_mut()).ok_or(())?;
+    let task = pcb.task.clone();
+    *pcbs.get_mut(desc).unwrap() = None;
+    task.notify();
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn pcb_get_mut<'a>(
+    pcbs: &'a mut [Option<TcpPcb>],
+    desc: usize,
+) -> Option<&'a mut TcpPcb> {
+    pcbs.get_mut(desc).and_then(|s| s.as_mut())
+}
+
+fn pcb_select(pcbs: &[Option<TcpPcb>], local: IpEndp, remote: IpEndp) -> Option<usize> {
+    let mut candidate: Option<usize> = None;
+    for (i, slot) in pcbs.iter().enumerate() {
+        let Some(pcb) = slot.as_ref() else { continue };
+        if pcb.local.port != local.port {
+            continue;
+        }
+        let local_match = pcb.local.addr == local.addr
+            || pcb.local.addr == IpAddr::ANY
+            || local.addr != IpAddr::ANY;
+        if !local_match {
+            continue;
+        }
+        let remote_match = (pcb.remote.addr == remote.addr && pcb.remote.port == remote.port)
+            || (pcb.remote.addr == IpAddr::ANY && pcb.remote.port == 0)
+            || (remote.addr == IpAddr::ANY && remote.port == 0);
+        if !remote_match {
+            continue;
+        }
+        if pcb.state != TcpState::Listen {
+            return Some(i);
+        }
+        candidate = Some(i);
+    }
+    candidate
+}
+
+fn output_segment(
+    seq: u32,
+    ack: u32,
+    flg: u8,
+    wnd: u16,
+    data: &[u8],
+    local: IpEndp,
+    remote: IpEndp,
+) -> Result<usize, ()> {
+    let hlen = TCP_HDR_SIZE;
+    let total = hlen + data.len();
+    let mut buf = vec![0u8; total];
+
+    buf[0..2].copy_from_slice(&local.port.to_be_bytes());
+    buf[2..4].copy_from_slice(&remote.port.to_be_bytes());
+    buf[4..8].copy_from_slice(&seq.to_be_bytes());
+    buf[8..12].copy_from_slice(&ack.to_be_bytes());
+    buf[12] = ((hlen / 4) as u8) << 4;
+    buf[13] = flg;
+    buf[14..16].copy_from_slice(&wnd.to_be_bytes());
+    // sum (16..18) and up (18..20) are zero
+    buf[hlen..].copy_from_slice(data);
+
+    let pseudo = build_pseudo_header(local.addr, remote.addr, total as u16);
+    let init = !util::cksum16(&pseudo, 0) as u32;
+    let sum = util::cksum16(&buf, init);
+    buf[16..18].copy_from_slice(&sum.to_ne_bytes());
+
+    crate::debugf!("{} => {}, len={}", local, remote, total);
+    print(&buf);
+
+    ip::output(IP_PROTOCOL_TCP, &buf, local.addr, remote.addr)?;
+    Ok(data.len())
+}
+
+/// RFC793 section 3.9 [Event Processing > SEGMENT ARRIVES]
+fn segment_arrives(
+    pcbs: &mut Vec<Option<TcpPcb>>,
+    seg: &SegInfo,
+    flags: u8,
+    _data: &[u8],
+    local: IpEndp,
+    remote: IpEndp,
+) {
+    let pcb_desc = pcb_select(pcbs, local, remote);
+    let is_closed = match pcb_desc {
+        Some(desc) => pcbs[desc].as_ref().unwrap().state == TcpState::Closed,
+        None => true,
+    };
+    if is_closed {
+        crate::debugf!(
+            "PCB is {}",
+            if pcb_desc.is_some() { "closed" } else { "not found" }
+        );
+        if flag_isset(flags, TCP_FLG_RST) {
+            return;
+        }
+        if !flag_isset(flags, TCP_FLG_ACK) {
+            let _ = output_segment(
+                0,
+                seg.seq.wrapping_add(seg.len),
+                TCP_FLG_RST | TCP_FLG_ACK,
+                0,
+                &[],
+                local,
+                remote,
+            );
+        } else {
+            let _ = output_segment(seg.ack, 0, TCP_FLG_RST, 0, &[], local, remote);
+        }
+        return;
+    }
+    // TODO: implemented in the next step
+}
+
 fn input(hdr: &IpHdr<'_>, data: &[u8], iface: &IpIface) {
     if data.len() < TCP_HDR_SIZE {
         crate::errorf!("too short, len={}", data.len());
@@ -199,6 +436,24 @@ fn input(hdr: &IpHdr<'_>, data: &[u8], iface: &IpIface) {
         iface.dev().name,
     );
     print(data);
+
+    let hlen = tcp.hlen();
+    let mut seg_len = (data.len() - hlen) as u32;
+    if flag_isset(tcp.flg(), TCP_FLG_SYN) {
+        seg_len += 1;
+    }
+    if flag_isset(tcp.flg(), TCP_FLG_FIN) {
+        seg_len += 1;
+    }
+    let seg = SegInfo {
+        seq: tcp.seq(),
+        ack: tcp.ack(),
+        len: seg_len,
+        wnd: tcp.wnd(),
+        up: tcp.up(),
+    };
+    let mut pcbs = PCBS.lock();
+    segment_arrives(&mut pcbs, &seg, tcp.flg(), &data[hlen..], dst, src);
 }
 
 pub fn init() -> Result<(), ()> {
