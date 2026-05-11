@@ -645,7 +645,7 @@ fn segment_arrives(
             return;
         }
     }
-    if pcb.state == TcpState::Established {
+    if matches!(pcb.state, TcpState::Established | TcpState::CloseWait) {
         if pcb.snd.una < seg.ack && seg.ack <= pcb.snd.nxt {
             pcb.snd.una = seg.ack;
             retrans_queue_cleanup(pcb);
@@ -663,9 +663,16 @@ fn segment_arrives(
             let _ = output(pcb, TCP_FLG_ACK, &[]);
             return;
         }
+    } else if pcb.state == TcpState::LastAck {
+        if seg.ack == pcb.snd.nxt {
+            transition(pcb, desc, TcpState::Closed);
+            let _ = pcb_release(pcbs, desc);
+        }
+        return;
     }
     // 6th URG bit (ignore)
     // 7th process segment text (ESTABLISHED)
+    let pcb = pcbs[desc].as_mut().unwrap();
     if pcb.state == TcpState::Established && !data.is_empty() {
         let len = data.len();
         if pcb.rcv.nxt != seg.seq || (pcb.rcv.wnd as usize) < len {
@@ -681,7 +688,25 @@ fn segment_arrives(
         let task = pcb.task.clone();
         task.notify();
     }
-    // 8th FIN bit (TODO)
+    // 8th check the FIN bit
+    if flag_isset(flags, TCP_FLG_FIN) {
+        let pcb = pcbs[desc].as_mut().unwrap();
+        match pcb.state {
+            TcpState::Closed | TcpState::Listen => return,
+            _ => {}
+        }
+        pcb.rcv.nxt = seg.seq.wrapping_add(1);
+        let _ = output(pcb, TCP_FLG_ACK, &[]);
+        match pcb.state {
+            TcpState::SynReceived | TcpState::Established => {
+                transition(pcb, desc, TcpState::CloseWait);
+                let task = pcb.task.clone();
+                task.notify();
+            }
+            // CLOSE_WAIT / LAST_ACK: remain in current state
+            _ => {}
+        }
+    }
 }
 
 fn input(hdr: &IpHdr<'_>, data: &[u8], iface: &IpIface) {
@@ -869,15 +894,44 @@ pub fn open(local: IpEndp, remote: IpEndp, active: bool) -> Result<TcpDesc, ()> 
 
 pub fn close(desc: TcpDesc) -> Result<(), ()> {
     let mut pcbs = PCBS.lock();
-    {
-        let pcb = pcb_get_mut(&mut pcbs, desc).ok_or_else(|| {
-            crate::errorf!("pcb not found, desc={}", desc);
-        })?;
-        crate::debugf!("desc={}", desc);
-        let _ = output(pcb, TCP_FLG_RST, &[]);
-        transition(pcb, desc, TcpState::Closed);
+    let pcb = pcb_get_mut(&mut pcbs, desc).ok_or_else(|| {
+        crate::errorf!("pcb not found, desc={}", desc);
+    })?;
+    crate::debugf!("desc={}", desc);
+    match pcb.state {
+        TcpState::Closed => {
+            crate::errorf!("connection does not exist");
+            return Err(());
+        }
+        TcpState::Listen | TcpState::SynSent => {
+            transition(pcb, desc, TcpState::Closed);
+        }
+        TcpState::SynReceived | TcpState::Established => {
+            // Tentative: send RST. Proper active close lands in step 27.
+            let _ = output(pcb, TCP_FLG_RST, &[]);
+            transition(pcb, desc, TcpState::Closed);
+        }
+        TcpState::CloseWait => {
+            crate::debugf!("close connection");
+            let _ = output(pcb, TCP_FLG_ACK | TCP_FLG_FIN, &[]);
+            pcb.snd.nxt = pcb.snd.nxt.wrapping_add(1);
+            transition(pcb, desc, TcpState::LastAck);
+        }
+        TcpState::LastAck => {
+            crate::errorf!("connection closing");
+            return Err(());
+        }
+        other => {
+            crate::errorf!("unknown state '{}'", other);
+            return Err(());
+        }
     }
-    pcb_release(&mut pcbs, desc)?;
+    if pcbs[desc].as_ref().map(|p| p.state) == Some(TcpState::Closed) {
+        pcb_release(&mut pcbs, desc)?;
+    } else {
+        let task = pcb_get_mut(&mut pcbs, desc).unwrap().task.clone();
+        task.notify();
+    }
     Ok(())
 }
 
@@ -889,9 +943,16 @@ pub fn send(desc: TcpDesc, data: &[u8]) -> Result<usize, ()> {
             let pcb = pcb_get_mut(&mut pcbs, desc).ok_or_else(|| {
                 crate::errorf!("pcb not found, desc={}", desc);
             })?;
-            if pcb.state != TcpState::Established {
-                crate::errorf!("invalid state '{}'", pcb.state);
-                return Err(());
+            match pcb.state {
+                TcpState::Established | TcpState::CloseWait => {}
+                TcpState::LastAck => {
+                    crate::errorf!("connection closing");
+                    return Err(());
+                }
+                other => {
+                    crate::errorf!("invalid state '{}'", other);
+                    return Err(());
+                }
             }
             if sent >= data.len() {
                 return Ok(sent);
@@ -931,18 +992,37 @@ pub fn receive(desc: TcpDesc, buf: &mut [u8]) -> Result<usize, ()> {
             let pcb = pcb_get_mut(&mut pcbs, desc).ok_or_else(|| {
                 crate::errorf!("pcb not found, desc={}", desc);
             })?;
-            if pcb.state != TcpState::Established {
-                crate::errorf!("unknown state '{}'", pcb.state);
-                return Err(());
-            }
-            if pcb.buf.is_empty() {
-                Some((pcb.task.clone(), pcb.task.snapshot()))
-            } else {
-                let n = buf.len().min(pcb.buf.len());
-                buf[..n].copy_from_slice(&pcb.buf[..n]);
-                pcb.buf.drain(..n);
-                pcb.rcv.wnd += n as u16;
-                return Ok(n);
+            match pcb.state {
+                TcpState::Established => {
+                    if pcb.buf.is_empty() {
+                        Some((pcb.task.clone(), pcb.task.snapshot()))
+                    } else {
+                        let n = buf.len().min(pcb.buf.len());
+                        buf[..n].copy_from_slice(&pcb.buf[..n]);
+                        pcb.buf.drain(..n);
+                        pcb.rcv.wnd += n as u16;
+                        return Ok(n);
+                    }
+                }
+                TcpState::CloseWait => {
+                    if pcb.buf.is_empty() {
+                        crate::debugf!("connection closing");
+                        return Ok(0);
+                    }
+                    let n = buf.len().min(pcb.buf.len());
+                    buf[..n].copy_from_slice(&pcb.buf[..n]);
+                    pcb.buf.drain(..n);
+                    pcb.rcv.wnd += n as u16;
+                    return Ok(n);
+                }
+                TcpState::LastAck => {
+                    crate::debugf!("connection closing");
+                    return Ok(0);
+                }
+                other => {
+                    crate::errorf!("unknown state '{}'", other);
+                    return Err(());
+                }
             }
         };
         if let Some((task, snapshot)) = wait {

@@ -75,6 +75,8 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let ret = app_main();
+    // Give the FIN handshake a moment to complete before shutting down.
+    std::thread::sleep(std::time::Duration::from_secs(1));
     if cleanup().is_err() {
         return ExitCode::FAILURE;
     }
