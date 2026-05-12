@@ -10,7 +10,7 @@ This is a Rust port of [microps][microps], the C-language TCP/IP stack from the 
 ## Features
 
 - **Link layer**: Ethernet (Linux TAP), Loopback
-- **Network layer**: ARP with cache, IPv4 with routing, ICMP (echo reply, destination unreachable)
+- **Internet layer**: ARP with cache, IPv4 with routing, ICMP (echo reply, destination unreachable)
 - **Transport layer**: UDP, TCP (RFC 793 — connection management, retransmission, half-close, simultaneous open/close)
 - **Socket API**: BSD-style `socket` / `bind` / `listen` / `accept` / `connect` / `send` / `recv` / `sendto` / `recvfrom` / `close`
 
@@ -27,14 +27,14 @@ The implementation follows the book's 30 steps, one commit per step.
 Create the TAP device once per boot:
 
 ```sh
-sudo cargo xtask tap create
+cargo xtask tap create
 ```
 
 This brings up `tap0` at `192.0.2.1/24`. The stack itself answers on
 `192.0.2.2`. Tear it down with:
 
 ```sh
-sudo cargo xtask tap delete
+cargo xtask tap delete
 ```
 
 ## Run
